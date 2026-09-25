@@ -298,6 +298,10 @@ def main() -> None:
     s1s = val_s1.select("s1", "country")
     t = truth.join(s1s, on="s1", how="semi")
     floor = t.height / max(s1s.height, 1)
+    # validation halves by id parity (ids carry no information): configs are chosen on "tune", reported on "report"
+    half = pl.col("s1").str.extract(r"(\d+)$").cast(pl.Int64) % 2
+    s1s_tune, s1s_rep = s1s.filter(half == 0), s1s.filter(half == 1)
+    t_tune, t_rep = t.join(s1s_tune, on="s1", how="semi"), t.join(s1s_rep, on="s1", how="semi")
     wv = wide.filter(pl.col("role") == "val")
     tim_rows = []
 
@@ -324,14 +328,22 @@ def main() -> None:
                 f"{xv.height:,} val rows scored")
             del xt
 
-    # ---- every config: recall and list size on validation S1
+    def found_for(sc: str, family: str, config: str) -> pl.DataFrame:
+        cfg = json.loads(config)
+        if family == "pruned":
+            base, pv = pruned[sc]
+            return prune(base, pv, cfg["tau"], cfg.get("cap"))
+        cap = cfg.pop("cap", None)
+        return select(wv.filter(pl.col("scope") == sc), rule(**cfg), cap)
+
+    # ---- every config: recall and list size on the TUNE half of validation
     rows = []
     for sc in a.scopes:
         w = wv.filter(pl.col("scope") == sc)
         for fam, kw, cap in configs():
             found = select(w, rule(**kw), cap).select("s1", "cand")
             name = json.dumps({**{k: v for k, v in kw.items() if v not in (0, None)}, **({"cap": cap} if cap else {})})
-            rows += [{"family": fam, "scope": sc, "config": name, **r} for r in list_stats(found, t, s1s, pool_size).iter_rows(named=True)]
+            rows += [{"family": fam, "scope": sc, "config": name, **r} for r in list_stats(found, t_tune, s1s_tune, pool_size).iter_rows(named=True)]
         if sc in pruned:
             base, pv = pruned[sc]
             for tau in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]:
@@ -339,7 +351,7 @@ def main() -> None:
                     found = prune(base, pv, tau, cap).select("s1", "cand")
                     name = json.dumps({"union": UNION, "tau": tau, **({"cap": cap} if cap else {})})
                     rows += [{"family": "pruned", "scope": sc, "config": name, **r}
-                             for r in list_stats(found, t, s1s, pool_size).iter_rows(named=True)]
+                             for r in list_stats(found, t_tune, s1s_tune, pool_size).iter_rows(named=True)]
         log(f"[{sc}] configs evaluated")
     curve = pl.DataFrame(rows)
     curve.write_csv(out / "curve.csv")
@@ -347,15 +359,17 @@ def main() -> None:
     front = pl.concat([pareto(allc.filter(pl.col("scope") == sc)) for sc in a.scopes])
     front.write_csv(out / "pareto.csv")
 
-    # ---- operating points: best recall at <= target candidates per S1 (ALL countries), then per country
+    # ---- operating points: chosen on the TUNE half (best recall at <= target candidates per S1, ALL countries),
+    # reported on the REPORT half (unbiased), per country
     ops = []
     for sc in a.scopes:
         for tg in TARGETS:
             c = allc.filter((pl.col("scope") == sc) & (pl.col("avg") <= tg)).sort("recall", "avg", descending=[True, False])
             if c.height:
                 r = c.row(0, named=True)
-                ops += [{"target": tg, **x} for x in curve.filter((pl.col("scope") == sc) & (pl.col("config") == r["config"])
-                                                                  & (pl.col("family") == r["family"])).iter_rows(named=True)]
+                st = list_stats(found_for(sc, r["family"], r["config"]).select("s1", "cand"), t_rep, s1s_rep, pool_size)
+                ops += [{"target": tg, "family": r["family"], "scope": sc, "config": r["config"], "tune_recall": r["recall"],
+                         "tune_avg": r["avg"], **x} for x in st.iter_rows(named=True)]
     ops = pl.DataFrame(ops)
     ops.write_csv(out / "operating_points.csv")
     plot(curve, front, ops, floor, out / "blocking_curve.png")
@@ -365,7 +379,7 @@ def main() -> None:
                          tr[3].select("entity_id", "core_name", "business_name", "state")]).rename(
         {"entity_id": "cand", "core_name": "m_core", "business_name": "m_name", "state": "m_state"})
     s1_state = tr[1].select(pl.col("entity_id").alias("s1"), pl.col("state").alias("s1_state"))
-    g = t.join(val_s1.select("s1", "country", "core_name", "n_core"), on="s1").join(matches, on="cand", how="left").join(s1_state, on="s1")
+    g = t_rep.join(val_s1.select("s1", "country", "core_name", "n_core"), on="s1").join(matches, on="cand", how="left").join(s1_state, on="s1")
     g = g.with_columns(pl.Series("tsr", process.cpdist(g["core_name"].to_list(), g["m_core"].fill_null("").to_list(),
                                                        scorer=fuzz.token_set_ratio, workers=-1)))
     groups = {
@@ -378,13 +392,8 @@ def main() -> None:
     }
     rows = []
     for r in ops.filter(pl.col("country") == "ALL").iter_rows(named=True):
-        sc, cfg = r["scope"], json.loads(r["config"])
-        if r["family"] == "pruned":
-            base, pv = pruned[sc]
-            found = prune(base, pv, cfg["tau"], cfg.get("cap"))
-        else:
-            cap = cfg.pop("cap", None)
-            found = select(wv.filter(pl.col("scope") == sc), rule(**cfg), cap)
+        sc = r["scope"]
+        found = found_for(sc, r["family"], r["config"])
         gg = g.join(found.select("s1", "cand", pl.lit(True).alias("found")), on=["s1", "cand"], how="left").with_columns(
             pl.col("found").fill_null(False))
         for gname, cond in groups.items():
@@ -424,7 +433,9 @@ def main() -> None:
     cols = ["country", "recall", "avg", "median", "p95", "empty_share", "reduction_ratio"]
     report = ["# Blocking evaluation: recall vs candidates per S1 (validation split vs full train pool)\n",
               f"Validation: {s1s.height:,} S1, {t.height:,} true pairs, **{floor:.2f} true matches per S1** (floor for the "
-              f"average list size). Pruner trained on {trn_ids.len():,} train-split S1.\n"]
+              f"average list size). Pruner trained on {trn_ids.len():,} train-split S1. Validation is split in halves by id "
+              f"parity: configs and operating points are chosen on the tune half ({s1s_tune.height:,} S1; curve, Pareto) "
+              f"and reported on the report half ({s1s_rep.height:,} S1; operating points, groups).\n"]
     for sc in a.scopes:
         report += [f"# Scope: {sc}\n", "## Operating points\n"]
         for r in ops.filter((pl.col("scope") == sc) & (pl.col("country") == "ALL")).iter_rows(named=True):
