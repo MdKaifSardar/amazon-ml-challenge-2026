@@ -1,0 +1,18 @@
+{
+  "id": "sayanchatterjee264/blocking-eval-gpu",
+  "title": "blocking-eval-gpu",
+  "code_file": "blocking-eval-gpu.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sayanchatterjee264/amazon-ml-2026"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "sayanchatterjee264/normalise-v3",
+    "sayanchatterjee264/phase0-eda"
+  ]
+}
