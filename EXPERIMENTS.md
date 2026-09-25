@@ -110,3 +110,74 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - Keep both full_name and core_name similarities (plus the all-legal-words-removed variant agreed for
       mid-name legal words).
 
+- **2026-09-25, blocking + candidate selection (no model yet, so no val F0.5).** The organiser update makes the
+  candidate set size part of the ranking, so every design is judged on recall AND candidates per S1.
+  - Setup:
+    - Validation split = 99,994 S1 against the full train S2/S3 pool (India 4.1M, US 6.2M).
+    - Validation is halved by id parity: configs are chosen on the tune half and reported on the report half
+      (50k S1, 173k true pairs). The floor is 3.46 true matches per S1.
+    - The pruner is trained on 100k train-split S1 only (asserted disjoint from validation).
+    - Code: `src/blocking.py`, `src/candidates.py`, `src/run_blocking_eval.py`.
+  - **Kaggle `blocking-eval-v2`** (65 min, peak 18.4 GB; GPU check passed but CPU was 11x faster, so searches ran
+    on CPU). Within-state buckets; the union for the pruner is fwd top-20 + reverse top-3 + rare top-10 (u20).
+    - ~5 candidates per S1: recall 95.4% (India 91.8, US 97.8), 4.8 per S1 (median 5, p95 8).
+    - ~7 candidates per S1: recall 96.5% (India 93.2, US 98.7), 7.1 per S1 (median 6, p95 14).
+    - Without the pruner, u20 = 96.9% at 49 per S1; the maximum is 97.4% at 118 per S1.
+    - Groups at ~7: common names 95.8%, low name similarity 89.0%, Indian script 81.3%, match without a state
+      79.9%, state differs 2.6% (0.5% of pairs).
+  - **Kaggle `blocking-eval-v3`** (search jobs `blocking-train-india` 39 min and `blocking-train-us` 46 min, then
+    evaluate 25 min, peak 22.8 GB, all CPU). Changes:
+    - A missing state is inferred from the city, then the département. The maps are learned from records that have
+      both (>= 20 records, >= 90% agreement; train + test, no labels) and are used for bucket placement and pruner
+      features.
+    - Pool records still without a state run the reverse search against all S1 of the country.
+    - Pruner also on a larger starting list u50 = fwd top-50 + reverse top-5 + rare top-20. Training rows are capped
+      at 6M (all positives kept).
+
+    | operating point | config | recall ALL | India | US | avg / median / p95 per S1 |
+    |---|---|---|---|---|---|
+    | ~5 | pruner u50, tau 0.1, cap 20 | 95.8% | 92.6% | 98.0% | 4.8 / 5 / 8 |
+    | **~7 (default)** | pruner u50, tau 0.01, cap 10 | **96.8%** | 94.0% | 98.8% | **6.6 / 6 / 10** |
+    | ~10 | pruner u50, tau 0.005 | 97.2% | 94.4% | 99.0% | 8.7 / 7 / 18 |
+    | ~12 | pruner u50, tau 0.002 | 97.3% | 94.6% | 99.2% | 11.7 / 9 / 26 |
+
+    - Effects at ~7, v2 → v3: recall 96.5% at 7.1 → 96.8% at 6.6, better on both axes.
+      - The no-state fallback alone (same u20 pruner): 96.4% at 6.6 → 96.7% at 6.9. The blocking union u20 goes
+        96.9 → 97.0% at the same size, and reverse top-1 90.4 → 92.7%.
+      - The larger starting list (u50 vs u20 in v3): 96.7% at 6.9 → 96.9% at 6.6 on the tune half, i.e. +0.2 pt
+        recall with fewer candidates. That is small, as expected: u50 holds about 1% more true pairs than u20.
+    - Group "match has no state": 79.9% (v2) → **82.4%** at ~7 (88.1% at ~12). Indian script 81.3 → 83.7%,
+      low name similarity 89.0 → 90.0%. State differs is unchanged at 2.5% (882 pairs, 0.5%).
+    - Cost: the reverse search does more comparisons (India 3.5 → 4.7e11, US 3.6 → 6.6e11 pairs; +34% / +81%).
+      Estimated test blocking is 2.8 h CPU in total (TF-IDF build 15 min, searches 1.9 h, pruner 37 min).
+    - Pruner audit:
+      - 22 generic features: blocking scores / ranks / gaps, method agreement, list rank and size, rapidfuzz name
+        and address similarity, same city / state. No country, source or language feature.
+      - Trained only on train-split S1.
+      - 22–34% of candidates have no city/state even after inference (empty or unparseable addresses, which appear
+        as candidates far more often than their 3–5% share of records).
+    - Decision: keep the v3 design with the ~7 operating point (pruner u50, tau 0.01, cap 10).
+  - **France check on TEST data** (no labels; Kaggle `blocking-test-france` 14 min over all 259k French test S1,
+    `blocking-test-usin` 71 min over 10% of US/India test S1 with the full pool, then `blocking-test-check`
+    ~15 min). It applies the v3 pruner and the ~7 operating point chosen on validation.
+
+    | | France | India | US |
+    |---|---|---|---|
+    | S2/S3 state detected / from city / none | 33% / 64% / 3% | 95% / 2% / 2% | 97% / 0% / 3% |
+    | search groups (S1 buckets) | 3 | 26 | 46 |
+    | comparisons vs whole-country search | 36% | 12% | 7% |
+    | candidates per S1 after pruner (avg / median / p95) | 7.5 / 8 / 10 | 7.7 / 8 / 10 | 6.8 / 7 / 10 |
+    | S1 with no candidate | 0.01% | 0.03% | 0.01% |
+    | S1 lists at the cap (8–10) | 53% | 55% | 38% |
+    | median best pruner score per S1 | 0.997 | 0.994 | 0.996 |
+    | same-state / same-city feature missing | 20% / 20% | 22% / 23% | 31% / 31% |
+
+    - France gets a state from its région. Normalisation finds it for only 33% of S2/S3 records; city inference
+      fills 64% more. All French test S1 fall in just 3 régions (Hauts-de-France, Nouvelle-Aquitaine, Pays de la
+      Loire), so the within-state search compares 36% of all pairs instead of 7–12%. That is the only flag, and it
+      is a cost issue (France took 14 min), not quality.
+    - No sign of worse blocking for France: similar list sizes, almost no empty lists, the pruner confident on
+      the best candidate, and location features missing less often than for US/India.
+    - Watch item: slightly more French candidates pass tau (8.6% vs 6.4–6.7%). With cap 10, lists hit the cap
+      as often as India's. If French S1 have more true matches than the cap allows, the cap could cut some. It
+      cannot be measured without labels; check by eye in the prediction sanity check.
