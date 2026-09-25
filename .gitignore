@@ -1,24 +1,58 @@
-# Environment
+# Environment & OS
 .venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 .DS_Store
+Thumbs.db
+*.log
 
-# Organiser data and derived copies (large; never commit)
+# Organiser data, samples, and derived formats (large; NEVER commit)
 dataset/
-data_parquet/
-data_sample/
+data/
+data_*/
+archive/
+archives/
+6ab10eb3b23ba_student_resource/
+
+# Global data extensions (catch-all for data files placed anywhere)
+*.parquet
+*.tsv
+*.feather
+*.h5
+*.hdf5
+
+# Compressed archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.rar
+*.7z
+
+# Model weights, checkpoints, and telemetry
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.onnx
+*.joblib
+*.pkl
+*.pickle
+catboost_info/
+wandb/
 
 # Cached intermediates, Kaggle job downloads, generated outputs
 artifacts/
 outputs/
-output/*.tsv
-catboost_info/
-*.zip
+output/
 scratch/
 
-# Credentials (never commit)
+# Credentials & secrets (never commit)
 .env
 kaggle.json
 access_token
@@ -28,8 +62,8 @@ credentials.json
 CLAUDE.md
 context/
 *.pdf
-6ab10eb3b23ba_student_resource/
 
 # Local-only docs (keep private; docs/eda_findings.md is published)
 docs/eda_summary.md
 docs/student_resource_README.md
+
