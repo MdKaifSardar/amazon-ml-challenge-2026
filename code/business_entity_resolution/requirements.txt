@@ -1,2 +1,5 @@
 polars==1.44.2
 pyarrow==25.0.1
+numpy==2.5.3
+rapidfuzz==3.14.6
+anyascii==0.3.3

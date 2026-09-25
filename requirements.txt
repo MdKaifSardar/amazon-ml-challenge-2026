@@ -4,3 +4,4 @@
 
 # Dev-only tools (not needed to reproduce the outputs)
 kaggle==2.2.4
+pytest==9.1.1

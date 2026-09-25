@@ -1,0 +1,15 @@
+{
+  "id": "sayanchatterjee264/phase0-eda",
+  "title": "phase0-eda",
+  "code_file": "phase0-eda.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sayanchatterjee264/amazon-ml-2026"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

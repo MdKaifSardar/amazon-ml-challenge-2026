@@ -8,6 +8,7 @@ __pycache__/
 # Organiser data and derived copies (large; never commit)
 dataset/
 data_parquet/
+data_sample/
 
 # Cached intermediates, Kaggle job downloads, generated outputs
 artifacts/
@@ -21,3 +22,7 @@ catboost_info/
 kaggle.json
 access_token
 credentials.json
+
+# Local docs and assistant context (not published)
+docs/
+CLAUDE.md
