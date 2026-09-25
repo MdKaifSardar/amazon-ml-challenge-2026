@@ -57,6 +57,9 @@ scratch/
 kaggle.json
 access_token
 credentials.json
+*.pem
+aws-setup/
+
 
 # Local assistant context & personal scratchpad (not published)
 CLAUDE.md
