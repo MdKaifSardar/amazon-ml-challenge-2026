@@ -20,7 +20,8 @@ Search scope (a compute split, not a filter):
 The rare-token index ignores states in both scopes.
 
 Top-k search runs on the GPU when torch sees one (dense score blocks + torch.topk), otherwise on CPU with
-sparse_dot_topn. check_gpu() compares the two on a slice before a run.
+sparse_dot_topn. check_gpu() compares the two on a slice before a run (tie-aware: scores per rank and
+exact recomputation) and the faster device does the searches.
 
 Near-identical decoys are NOT filtered here; every method keeps its full top-k.
 """
@@ -128,20 +129,32 @@ def _topn(Q: sparse.csr_matrix, P: sparse.csr_matrix, k: int, keep_col: np.ndarr
     return (_topn_gpu if USE_GPU else _topn_cpu)(Q, P, k, keep_col)
 
 
-def check_gpu(Q: sparse.csr_matrix, P: sparse.csr_matrix, k: int, n_q: int = 2000, n_p: int = 300_000) -> dict:
-    """GPU vs CPU top-k on a slice: share of CPU (row, col) pairs the GPU also returns (ties at the k-th
-    score may swap), max score difference, and time per similarity evaluation on each device."""
+def check_gpu(Q: sparse.csr_matrix, P: sparse.csr_matrix, k: int, n_q: int = 4000, n_p: int = 1_000_000) -> dict:
+    """GPU vs CPU top-k on a slice, tie-aware. Many pool records share a name, so equal scores at the k-th
+    place may be kept differently; instead of comparing (row, col) pairs, compare the score at every rank
+    (rank_score_diff) and recompute each GPU pair's cosine exactly on CPU (pair_score_diff). Timing runs after
+    a warm-up call, so CUDA start-up is not counted."""
     Q, P = Q[:n_q], P[:n_p]
     k = min(k, P.shape[0])
+    _topn_gpu(Q[:64], P, k); torch.cuda.synchronize()  # warm-up (CUDA context, cuSPARSE handles)
     t0 = time.time(); g = _topn_gpu(Q, P, k); torch.cuda.synchronize(); t1 = time.time()
     c = _topn_cpu(Q, P, k); t2 = time.time()
+    by_rank = lambda x: pl.DataFrame({"r": x[0], "rk": x[3], "v": x[2]})
+    j = by_rank(c).join(by_rank(g), on=["r", "rk"], how="full", suffix="_g").with_columns(pl.col("v", "v_g").fill_null(0.0))
+    exact = np.asarray(Q[g[0]].multiply(P[g[1]]).sum(axis=1)).ravel()
     gp, cp = set(zip(g[0].tolist(), g[1].tolist())), set(zip(c[0].tolist(), c[1].tolist()))
-    top1 = lambda x: dict(zip(x[0][x[3] == 1].tolist(), x[2][x[3] == 1].tolist()))
-    g1, c1 = top1(g), top1(c)
     pairs = Q.shape[0] * P.shape[0]
-    return {"agreement": len(gp & cp) / max(len(cp), 1),
-            "max_top1_diff": max((abs(g1.get(r, 0) - v) for r, v in c1.items()), default=0.0),
+    return {"queries": Q.shape[0], "pool": P.shape[0], "k": k,
+            "rank_score_diff": float((j["v"] - j["v_g"]).abs().max() or 0.0),
+            "pair_score_diff": float(np.abs(exact - g[2]).max()) if len(exact) else 0.0,
+            "pair_agreement": len(gp & cp) / max(len(cp), 1),
             "gpu_ns_per_pair": (t1 - t0) / pairs * 1e9, "cpu_ns_per_pair": (t2 - t1) / pairs * 1e9}
+
+
+def use_gpu(flag: bool) -> None:
+    """Choose the device for all later searches (GPU only if CUDA is available)."""
+    global USE_GPU
+    USE_GPU = bool(flag) and torch is not None and torch.cuda.is_available()
 
 
 def buckets(s1: pl.DataFrame, pool: pl.DataFrame, scope: str) -> tuple[np.ndarray, np.ndarray]:
@@ -222,8 +235,11 @@ def block_country(s1: pl.DataFrame, pool: pl.DataFrame, query_mask: np.ndarray, 
         if gpu_check and USE_GPU:
             chk = check_gpu(S[qrows], P, k)
             log(f"  GPU check: {chk}")
-            if chk["agreement"] < 0.99 or chk["max_top1_diff"] > 1e-3:
+            if chk["rank_score_diff"] > 1e-4 or chk["pair_score_diff"] > 1e-4:
                 raise RuntimeError(f"GPU top-k disagrees with CPU: {chk}")
+            use_gpu(chk["gpu_ns_per_pair"] < chk["cpu_ns_per_pair"])  # the faster device does all searches
+            log(f"  search device from now on: {'GPU' if USE_GPU else 'CPU (faster than GPU on this data)'}")
+            timing.append({"scope": "all", "method": "device_check", **chk, "device": "GPU" if USE_GPU else "CPU"})
             gpu_check = False
         for sc in scopes:
             s_bucket, p_bucket = bk[sc]

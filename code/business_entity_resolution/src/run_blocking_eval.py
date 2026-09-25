@@ -23,6 +23,7 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 except NameError:  # Kaggle notebook: modules are written to /tmp/src
     sys.path.insert(0, "/tmp/src")
+import blocking  # noqa: E402
 from blocking import FORWARD, NONE, SCOPES, _pairs_evaluated, block_country, buckets, gpu_info, texts, token_df  # noqa: E402
 
 K_GRID = [5, 10, 20, 30, 50, 75, 100]
@@ -276,7 +277,7 @@ def main() -> None:
     report += [
         "# Timing on validation (seconds)\n", md(tim, 80) + "\n",
         f"Measured rate: forward {rate.get('forward', 0) * 1e9:.2f} ns, reverse {rate.get('reverse', 0) * 1e9:.2f} ns per "
-        f"similarity evaluation ({gpu_info()}).\n",
+        f"similarity evaluation; searches ran on {'GPU' if blocking.USE_GPU else 'CPU'} ({gpu_info()}).\n",
         "# Test-time estimate (minutes)\n", md(est) + "\n", md(est_tot) + "\n",
         f"Peak memory of this run (host): {resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20:.1f} GB.\n",
     ]
