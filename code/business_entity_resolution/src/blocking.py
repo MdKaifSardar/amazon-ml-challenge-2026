@@ -4,7 +4,8 @@ Methods (all per country; the country is a compute split, 0 true pairs cross cou
 - name       forward TF-IDF top-k on core_name
 - name_city  forward TF-IDF top-k on core_name + city
 - name_addr  forward TF-IDF top-k on core_name + normalised address
-- reverse    for every S2/S3 record, its top-m S1 on core_name + address (all S1 of the split compete)
+- reverse    for every S2/S3 record, its top-m S1 on core_name + address (all S1 of the split compete); the
+             record's best score is kept so a margin rule (keep rank 2 only if close to rank 1) can be applied
 - rare       S2/S3 records sharing a rare core_name token (document frequency <= RARE_DF in the country)
 
 TF-IDF: char_wb 3-4-grams, fitted per country on train + test records (no labels; a seeded sample
@@ -176,31 +177,37 @@ def forward(Q, q_bucket: np.ndarray, P, p_bucket: np.ndarray, k: int) -> pl.Data
 
 
 def reverse(S, s_bucket: np.ndarray, P, p_bucket: np.ndarray, m: int, keep_s: np.ndarray | None = None) -> pl.DataFrame:
-    """For each pool row with a state: its top-m S1 rows in the same state. Returns (qi = S1 row, pi, score, rank).
-    keep_s: optional mask over S1 rows; only pairs with a kept S1 are returned (all S1 still compete)."""
+    """For each pool row with a state: its top-m S1 rows in the same state. Returns (qi = S1 row, pi, score, rank,
+    best), where best is the pool row's top-1 score over ALL S1 (for margin rules). keep_s: optional mask over S1
+    rows; only pairs with a kept S1 are returned (all S1 still compete)."""
     out = []
     for b in np.unique(p_bucket):
         if b == NONE:
             continue
         pi = np.flatnonzero(p_bucket == b)
         si = np.flatnonzero(s_bucket == b)
-        r, c, s, rk = _topn(P[pi], S[si], m, None if keep_s is None else keep_s[si])
-        out.append(pl.DataFrame({"qi": si[c], "pi": pi[r], "score": s, "rank": rk}))
-    return pl.concat(out) if out else pl.DataFrame(schema={"qi": pl.Int64, "pi": pl.Int64, "score": pl.Float32, "rank": pl.Int64})
+        r, c, s, rk = _topn(P[pi], S[si], m)
+        best = np.zeros(len(pi), dtype=np.float32)
+        best[r[rk == 1]] = s[rk == 1]
+        f = slice(None) if keep_s is None else keep_s[si[c]]
+        out.append(pl.DataFrame({"qi": si[c][f], "pi": pi[r][f], "score": s[f], "rank": rk[f], "best": best[r][f]}))
+    return pl.concat(out) if out else pl.DataFrame(schema={"qi": pl.Int64, "pi": pl.Int64, "score": pl.Float32,
+                                                           "rank": pl.Int64, "best": pl.Float32})
 
 
 def rare_tokens(q_names: pl.Series, p_names: pl.Series, df_counts: pl.DataFrame, max_df: int = RARE_DF) -> pl.DataFrame:
-    """Pool rows sharing a rare core_name token with the query (token df <= max_df in the country).
-    score = number of shared rare tokens; rank by score (ties by pool order)."""
+    """Pool rows sharing a rare core_name token with the query (token df <= max_df in the country, so at most
+    ~max_df x tokens rows per query). score = number of shared rare tokens; rank by score, ties by pool row
+    (deterministic, so pieces merge exactly)."""
     rare = df_counts.filter((pl.col("df") <= max_df) & (pl.col("t").str.len_chars() >= 3)).select("t")
     tok = lambda s, name: (pl.DataFrame({name: np.arange(s.len()), "t": s.str.split(" ")})
                            .explode("t", empty_as_null=True).filter(pl.col("t").is_not_null()).unique()
                            .join(rare, on="t"))
     qt, pt = tok(q_names, "qi"), tok(p_names, "pi")
     hits = qt.join(pt, on="t").group_by("qi", "pi").agg(pl.len().cast(pl.Float32).alias("score"))
-    return hits.with_columns(
-        pl.col("score").rank("ordinal", descending=True).over("qi").cast(pl.Int64).alias("rank")
-    ).select("qi", "pi", "score", "rank")
+    return (hits.sort("qi", "score", "pi", descending=[False, True, False])
+            .with_columns(pl.int_range(1, pl.len() + 1, dtype=pl.Int64).over("qi").alias("rank"))
+            .select("qi", "pi", "score", "rank"))
 
 
 def token_df(names: pl.Series) -> pl.DataFrame:
@@ -214,12 +221,16 @@ def block_country(s1: pl.DataFrame, pool: pl.DataFrame, query_mask: np.ndarray, 
                   df_counts: pl.DataFrame, k: int, m: int, scopes: tuple[str, ...] = ("state",),
                   skip: Callable[[str, str, float], bool] = lambda scope, method, pairs: False,
                   log: Callable[[str], None] = print, gpu_check: bool = False,
-                  timing: list[dict] | None = None) -> tuple[pl.DataFrame, list[dict]]:
+                  timing: list[dict] | None = None, pool_mask: np.ndarray | None = None,
+                  reverse_keep: np.ndarray | None = None) -> tuple[pl.DataFrame, list[dict]]:
     """All methods for one country, for each search scope (same TF-IDF matrices). s1: ALL S1 of the split
     (reverse competition); query_mask: S1 rows to generate candidates for. skip(scope, method, pairs) may
     drop a search (e.g. over a time budget). Returns a long table (scope, qi = S1 row, pi = pool row,
     method, score, rank) and one timing row per (scope, method), appended to `timing` if given (so skip()
-    can read the rates measured so far)."""
+    can read the rates measured so far). pool_mask: pool rows that run the reverse search (a shard of the pool;
+    default all). Forward and rare searches run for the query_mask rows only, so a shard = (S1 slice, pool slice)
+    and the union of all shards equals one full run. reverse_keep: S1 rows whose reverse hits are returned
+    (default query_mask; with pool shards pass ALL wanted S1, since any S1 can be hit from any pool shard)."""
     ts, tp = texts(s1), texts(pool)
     qrows = np.flatnonzero(query_mask)
     bk = {sc: buckets(s1, pool, sc) for sc in scopes}
@@ -256,16 +267,18 @@ def block_country(s1: pl.DataFrame, pool: pl.DataFrame, query_mask: np.ndarray, 
                                "pool": P.shape[0], "pairs_evaluated": pairs})
                 log(f"  [{sc}] {rep}: forward {time.time() - t2:.0f}s, {pairs:.2e} pairs, {f.height:,} rows")
             if rep == REVERSE_REP:
-                pairs = _pairs_evaluated(p_bucket[p_bucket != NONE], s_bucket, with_none=False)
+                prow = np.arange(P.shape[0]) if pool_mask is None else np.flatnonzero(pool_mask)
+                pairs = _pairs_evaluated(p_bucket[prow][p_bucket[prow] != NONE], s_bucket, with_none=False)
                 if skip(sc, "reverse", pairs):
                     log(f"  [{sc}] reverse: skipped ({pairs:.2e} pairs over budget)")
                     timing.append({"scope": sc, "method": "reverse", "pairs_evaluated": pairs, "skipped": True})
                     continue
                 t3 = time.time()
-                r = reverse(S, s_bucket, P, p_bucket, m, keep_s=query_mask)
-                parts.append(r.with_columns(pl.lit(sc).alias("scope"), pl.lit("reverse").alias("method")))
+                r = reverse(S, s_bucket, P[prow], p_bucket[prow], m, keep_s=query_mask if reverse_keep is None else reverse_keep)
+                r = r.with_columns(pl.Series("pi", prow[r["pi"].to_numpy()], dtype=pl.Int64))  # shard row -> pool row
+                parts.append(r.with_columns(pl.lit(sc).alias("scope"), pl.lit("reverse").alias("method")))  # has "best"
                 timing.append({"scope": sc, "method": "reverse", "search_s": time.time() - t3,
-                               "queries": int((p_bucket != NONE).sum()), "pool": S.shape[0], "pairs_evaluated": pairs})
+                               "queries": int((p_bucket[prow] != NONE).sum()), "pool": S.shape[0], "pairs_evaluated": pairs})
                 log(f"  [{sc}] reverse: {time.time() - t3:.0f}s, {pairs:.2e} pairs, {r.height:,} rows")
         del S, P
     t5 = time.time()
@@ -275,7 +288,8 @@ def block_country(s1: pl.DataFrame, pool: pl.DataFrame, query_mask: np.ndarray, 
     timing.append({"scope": "all", "method": "rare", "search_s": time.time() - t5, "queries": len(qrows),
                    "pool": pool.height, "pairs_evaluated": None})
     log(f"  rare: {time.time() - t5:.0f}s")
-    cols = ["scope", "qi", "pi", "method", "score", "rank"]
+    cols = ["scope", "qi", "pi", "method", "score", "rank", "best"]
+    parts = [p if "best" in p.columns else p.with_columns(pl.lit(None, dtype=pl.Float32).alias("best")) for p in parts]
     return pl.concat([p.select(cols) for p in parts]), timing
 
 
