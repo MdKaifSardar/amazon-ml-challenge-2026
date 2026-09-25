@@ -1,0 +1,23 @@
+# Environment
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.DS_Store
+
+# Organiser data and derived copies (large; never commit)
+dataset/
+data_parquet/
+
+# Cached intermediates, Kaggle job downloads, generated outputs
+artifacts/
+outputs/
+output/*.tsv
+catboost_info/
+*.zip
+
+# Credentials (never commit)
+.env
+kaggle.json
+access_token
+credentials.json

@@ -1,0 +1,6 @@
+# Full dev environment for this project: pip install -r requirements.txt
+# Pipeline dependencies live in the submission's own file (pinned), included here:
+-r code/business_entity_resolution/requirements.txt
+
+# Dev-only tools (not needed to reproduce the outputs)
+kaggle==2.2.4
