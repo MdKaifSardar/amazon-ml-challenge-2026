@@ -1,6 +1,6 @@
 # Business Entity Resolution pipeline
 
-Status: Phase 1 (data preparation, EDA, scorer, all-empty baseline). Matching model not built yet.
+Status: Phase 1 done (data preparation, EDA, scorer, all-empty baseline); shared normalisation built. Blocking and matching model not built yet.
 
 ## Setup
 ```bash
@@ -22,3 +22,7 @@ Run all commands below from this folder (`code/business_entity_resolution/`), wi
 ## Modules
 - `src/metric.py`: macro F0.5 exactly as the challenge defines it (tests in `tests/test_metric.py`, run with `python -m pytest tests`).
 - `src/submission.py`: writes `matching_results.tsv` and `candidate_pairs.tsv` in the required format.
+- `src/normalise.py`: shared name/address normalisation (`Normaliser.names()`, `Normaliser.addresses()`), plus
+  `learn_state_aliases()` to learn state spellings from train pairs (tests in `tests/test_normalise.py`).
+- `src/eval_normalise.py`: learns state aliases and reports same-city/same-state agreement of true pairs:
+  `python src/eval_normalise.py --data-dir ../../data_sample --aliases ../../artifacts/state_aliases.json`

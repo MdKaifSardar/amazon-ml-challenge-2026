@@ -17,3 +17,23 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
   empty = 1.0, singleton with prediction = 0.0, empty prediction with true matches = 0.0, and macro averaging.
 - **2026-09-25, all-empty test submission** written to `output/` (1,732,544 rows per file).
   `utils/validate_submission.py`: PASS, both default and `--check-ids`.
+- **2026-09-25, normalisation module** (`src/normalise.py`, tests in `tests/test_normalise.py`, eval in
+  `src/eval_normalise.py`). Local 1% sample only (`data_sample/`, 76,786 true pairs). Not yet a pipeline change, so
+  there's no val F0.5.
+  - 44/44 unit tests pass (11 metric + 33 normalisation, using real strings from `outputs/eda/`).
+  - Learned state aliases from the sample's train pairs: 14 India (e.g. mharastr, krnatk, telmgan, dilli, pscimbng),
+    1 US (atl -> ga, a false alias for Atlanta; recheck on full data). Saved to `artifacts/state_aliases.json`.
+  - Same-city agreement of true pairs, before (EDA heuristic) -> after:
+
+    | country | source | before | after | same state after |
+    |---|---|---|---|---|
+    | India | S2 | 61.5% | 73.1% | 98.6% |
+    | India | S3 | 46.1% | 90.8% | 98.6% |
+    | US | S2 | 75.1% | 80.7% | 99.9% |
+    | US | S3 | 7.5% | 82.6% | 99.9% |
+    | all | all | 45.7% | 81.9% | 99.3% |
+
+  - Remaining city mismatches are mostly typos (phenix/phoenix, austni/austin), county vs city, and merged words
+    (saintmichael). Leave these to fuzzy city features.
+  - Speed on 1M test S2 rows: names 3.3 s, addresses 8.1 s, peak 2.1 GB. France: city found for 97%, legal form 55%,
+    département 32%.
