@@ -16,6 +16,7 @@ outputs/
 output/*.tsv
 catboost_info/
 *.zip
+scratch/
 
 # Credentials (never commit)
 .env
@@ -23,8 +24,7 @@ kaggle.json
 access_token
 credentials.json
 
-# Local docs and assistant context (not published)
-docs/
+# Local assistant context & personal scratchpad (not published)
 CLAUDE.md
 context/
 *.pdf
