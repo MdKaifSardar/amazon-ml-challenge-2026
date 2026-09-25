@@ -26,3 +26,6 @@ credentials.json
 # Local docs and assistant context (not published)
 docs/
 CLAUDE.md
+context/
+*.pdf
+6ab10eb3b23ba_student_resource/
