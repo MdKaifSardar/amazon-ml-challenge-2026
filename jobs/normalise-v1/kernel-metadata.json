@@ -1,0 +1,17 @@
+{
+  "id": "sayanchatterjee264/normalise-v1",
+  "title": "normalise-v1",
+  "code_file": "normalise-v1.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sayanchatterjee264/amazon-ml-2026"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "sayanchatterjee264/phase0-eda"
+  ]
+}

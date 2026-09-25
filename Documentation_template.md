@@ -41,8 +41,13 @@ country label. Countries without their own table get only the general rules.
   like "bombay". Country-aware abbreviations follow: st -> street (US) vs saint (France). Outputs: `city` (the most
   frequent city-like component in the corpus, so reordered addresses agree), `state`, `dept` (French
   départements) and `numbers`.
-- **Effect.** On true pairs (1% sample), same-city agreement rose from 45.7% to 81.9%. For US S3 it rose from
-  7.5% to 82.6%. Same state is 99.3%.
+- **Leakage and open set.** State aliases use labels, so they are learned only from train pairs whose S1 is not
+  in the validation split, then saved and reused at inference. The city frequency vocabulary uses no labels
+  (train + test records). Countries without their own table (anything new in test) get only the generic rules.
+  The full list of rules is in `docs/normalisation.md`.
+- **Effect.** On the full train split, same-city agreement of true pairs is 72.5% (India S2), 89.7% (India S3),
+  81.9% (US S2) and 83.3% (US S3). The EDA heuristic gave 45.7% overall and 7.5% for US S3. Same state is
+  98.7–99.9%. Full-data run: Kaggle job `normalise-v2` (24.2M records, 16 min).
 
 ### 2.3 Solution Strategy
 *Outline your high-level approach.*

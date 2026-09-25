@@ -6,7 +6,7 @@ import polars as pl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from normalise import Normaliser, learn_state_aliases  # noqa: E402
+from normalise import NORM_VERSION, Normaliser, learn_state_aliases, normalise_records  # noqa: E402
 
 N = Normaliser()
 
@@ -92,8 +92,10 @@ def test_mid_name_legal_words_are_kept():
     assert r[1]["core_name"] == "saad sa developpement" and r[1]["legal"] == ""
 
 
-def test_name_that_is_only_a_suffix_keeps_itself():
-    assert names([("Company", "US")])[0]["core_name"] == "company"
+def test_name_that_is_only_a_suffix_falls_back_to_full_name():
+    r = names([("Company", "US"), ("LLC", "US"), ("Pvt Ltd", "India"), ("SARL", "France")])
+    assert [x["core_name"] for x in r] == [x["full_name"] for x in r] == ["co", "llc", "pvt ltd", "sarl"]
+    assert all(x["legal"] == "" for x in r)
 
 
 def test_abbreviations_all_countries_including_unseen():
@@ -205,3 +207,178 @@ def test_deterministic_and_order_preserving():
     a, b = N.names(raw, ctry), N.names(raw, ctry)
     assert a.equals(b)
     assert a["core_name"].to_list() == ["helios", "royal food", "jamais college", "helios"]
+
+
+# ------------------------------------------------------------------ Part 1: fallbacks and edge cases
+
+def test_empty_whitespace_and_null_inputs():
+    r = N.names(pl.Series(["", "   ", None]), pl.Series(["US", "India", None]))
+    assert r.to_dicts() == [{"full_name": "", "core_name": "", "legal": ""}] * 3
+    a = N.addresses(pl.Series(["", "  ", None]), pl.Series(["US", "", None])).to_dicts()
+    assert all(x["addr_norm"] == "" and x["city"] is None and x["numbers"] == [] for x in a)
+
+
+def test_numbers_and_punctuation_only_names():
+    r = names([("12345", "US"), ("!!! ---", "US"), ("7-Eleven", "US")])
+    assert r[0]["core_name"] == r[0]["full_name"] == "12345"
+    assert r[1]["full_name"] == "" and r[1]["core_name"] == ""  # no letters or digits: empty (raw is kept)
+    assert r[2]["core_name"] == "7 eleven"
+
+
+def test_repeated_suffixes_collapse():
+    r = names([("Royal Food Pvt Ltd Ltd", "India"), ("Acme Inc. Inc.", "US"), ("Acme LLC L.L.C.", "US")])
+    assert [x["legal"] for x in r] == ["pvt ltd", "inc", "llc"]
+    assert r[0]["full_name"] == "royal food pvt ltd"
+
+
+def test_mixed_scripts_in_one_string():
+    r = names([("Hotel कंसल्टेंट्स Private Limited", "India")])[0]
+    assert r["full_name"].isascii() and r["legal"] == "pvt ltd" and r["core_name"].startswith("hotel ")
+
+
+def test_very_long_strings():
+    long_name = "Alpha " * 3000 + "Private Limited"
+    long_addr = ", ".join(f"{i} Road" for i in range(2000)) + ", Pune, Maharashtra"
+    r = names([(long_name, "India")])[0]
+    assert r["legal"] == "pvt ltd" and len(r["core_name"].split()) == 3000
+    a = addrs([(long_addr, "India")])[0]
+    assert a["city"] == "pune" and a["state"] == "maharashtra" and len(a["numbers"]) == 2000
+
+
+def test_raw_columns_kept_by_normalise_records():
+    df = pl.DataFrame({"entity_id": ["S1-1", "S2-9"], "business_name": ["Helios Inc.", "M/s Nidhi Co"],
+                       "business_address": ["10 Main St, Hartford, CT", ""], "country": ["US", "India"]})
+    out = normalise_records(df, N)
+    assert out.select(df.columns).equals(df)
+    assert {"full_name", "core_name", "legal", "addr_norm", "city", "state", "dept", "numbers"} <= set(out.columns)
+    assert out["norm_version"].to_list() == [NORM_VERSION] * 2
+
+
+# ------------------------------------------------------------------ Part 2: aliases
+
+def test_city_abbreviation_next_to_a_state_is_not_an_alias():
+    # "atl" (Atlanta) is written next to the state ("ATL, GA"), so it does not replace the state
+    s1 = [f"{i} Peachtree Street, {c}, GA" for i, c in enumerate(["Atlanta", "Macon", "Athens", "Savannah"] * 10)]
+    s2 = [f"{i} Peachtree St, ATL, GA" for i in range(40)]
+    pairs = pl.DataFrame({"country": ["US"] * 400, "addr_1": s1 * 10, "addr_2": s2 * 10})
+    assert "atl" not in learn_state_aliases(pairs).get("us", {})
+
+
+def test_versioned_alias_file_roundtrip(tmp_path):
+    from normalise import save_state_aliases
+    path = tmp_path / f"state_aliases_{NORM_VERSION}.json"
+    save_state_aliases({"india": {"telmgan": "telangana"}}, path, {"learned_from": "test"})
+    n = Normaliser.load(path)
+    assert n.states("india")["telmgan"] == "telangana"
+    assert Normaliser.load(tmp_path / "missing.json").state_aliases == {}
+
+
+# ------------------------------------------------------------------ Part 3: open-set countries
+
+def test_germany_generic_rules_only():
+    n = names([("Müller GmbH", "Germany")])[0]
+    assert n == {"full_name": "muller gmbh", "core_name": "muller", "legal": "gmbh"}
+    a = addrs([("Hauptstraße 5, 10115 Berlin", "Germany")])[0]
+    assert a["city"] == "berlin" and a["state"] is None and a["dept"] is None
+    assert a["numbers"] == ["5", "10115"]
+
+
+def test_spain_generic_rules_only():
+    n = names([("Construcciones García S.L.", "Spain")])[0]
+    assert n["core_name"] == "construcciones garcia" and n["legal"] == "sl"
+    a = addrs([("Calle Mayor 3, Madrid", "Spain")])[0]
+    assert a["city"] == "madrid" and a["numbers"] == ["3"]
+
+
+@pytest.mark.parametrize("country", ["Atlantis", "", "  ", "XX-123"])
+def test_unknown_country_gets_no_country_specific_rules(country):
+    n = names([("Shri Balaji Traders", country), ("Casa Sa", country), ("Dr Smith Dental", country)])
+    assert n[0]["core_name"] == "shri balaji traders"   # no Indian honorific removal
+    assert n[1]["legal"] == ""                           # no French "sa"
+    assert n[2]["core_name"] == "dr smith dental"
+    a = addrs([("12 Main St, Springfield, TX", country), ("4 Rue St-Honore, Lyon", country)])
+    assert "main st" in a[0]["addr_norm"] and a[0]["state"] is None   # no US "st" -> street, no US states
+    assert "rue st honore" in a[1]["addr_norm"]                       # no French "st" -> saint
+    assert a[0]["numbers"] == ["12"] and a[0]["city"] in {"springfield", "tx"}
+
+
+def test_null_country_does_not_crash():
+    r = N.names(pl.Series(["Helios Inc."]), pl.Series([None], dtype=pl.String))
+    assert r["core_name"].to_list() == ["helios"]
+
+
+# ------------------------------------------------------------------ Part 3: France without training data
+
+def test_france_names():
+    r = names([("Boulangerie St Michel SARL", "France"), ("SAS Dupont et Fils", "France")])
+    assert r[0] == {"full_name": "boulangerie saint michel sarl", "core_name": "boulangerie saint michel", "legal": "sarl"}
+    assert r[1] == {"full_name": "dupont and fils sas", "core_name": "dupont and fils", "legal": "sas"}
+
+
+def test_france_addresses_postcode_city_and_departements():
+    r = addrs([("12 Rue St-Honoré, 75001 Paris", "France"),
+               ("3 Rue Nationale, Lille, Nord", "France"),
+               ("Nord, 3 RUE NATIONALE, LILLE", "France"),
+               ("7 Cours Victor Hugo, Bordeaux, Gironde, Nouvelle-Aquitaine", "France")])
+    assert r[0]["addr_norm"] == "12 rue saint honore, 75001 paris"
+    assert r[0]["city"] == "paris" and r[0]["dept"] is None and r[0]["numbers"] == ["12", "75001"]
+    assert [x["dept"] for x in r[1:]] == ["nord", "nord", "gironde"]
+    assert [x["city"] for x in r[1:]] == ["lille", "lille", "bordeaux"]
+    assert r[3]["state"] == "nouvelle aquitaine"
+
+
+# ------------------------------------------------------------------ Part 4: determinism and idempotence
+
+IDEMPOTENCE_NAMES = [
+    ("Royal Food Pvt. Ltd.", "India"), ("M/s Nidhi Infrastructure  Co", "India"), ("LLC Value Electronics", "US"),
+    ("Great Bay Polska L.L.C.", "US"), ("अल लॉजिस्टिक्स प्रा. लि.", "India"), ("SAS Dupont et Fils", "France"),
+    ("Boulangerie St Michel SARL", "France"), ("Müller GmbH", "Germany"), ("Dupont et Cie", "France"),
+    ("Acme Intl Mfg Corp", "Canada"), ("Company", "US"), ("12345", "US"),
+]
+IDEMPOTENCE_ADDRS = [
+    ("1795 Westchester Drive, High Point, NC", "US"), ("#30592 Twin Rose Ln, Princess Anne, Maryland", "US"),
+    ("12 Rue St-Honoré, 75001 Paris", "France"), ("16 R ARAGO, BORDEAUX, Nouvelle-Aquitaine", "France"),
+    ("510/8A, NEW HYDERABAD, NEAR WATER TANK PARK, LUCKNOW, Uttar Pradesh", "India"),
+    ("Hauptstraße 5, 10115 Berlin", "Germany"), ("Fl. 1, Missouri, 331 Avant Drive, Hazelwood", "US"),
+]
+
+
+def test_names_idempotent():
+    first = names(IDEMPOTENCE_NAMES)
+    again = names([(x["full_name"], c) for x, (_, c) in zip(first, IDEMPOTENCE_NAMES)])
+    assert [x["full_name"] for x in again] == [x["full_name"] for x in first]
+    core_again = names([(x["core_name"], c) for x, (_, c) in zip(first, IDEMPOTENCE_NAMES)])
+    assert [x["core_name"] for x in core_again] == [x["core_name"] for x in first]
+
+
+def test_addresses_idempotent():
+    first = addrs(IDEMPOTENCE_ADDRS)
+    again = addrs([(x["addr_norm"], c) for x, (_, c) in zip(first, IDEMPOTENCE_ADDRS)])
+    assert [x["addr_norm"] for x in again] == [x["addr_norm"] for x in first]
+    assert [x["numbers"] for x in again] == [x["numbers"] for x in first]
+
+
+SAMPLE = Path(__file__).resolve().parents[3] / "data_sample/train/train_source2.parquet"
+
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="local data_sample not available")
+def test_idempotent_and_deterministic_on_real_sample():
+    df = pl.read_parquet(SAMPLE).sample(3000, seed=1)
+    a = N.names(df["business_name"], df["country"])
+    assert a.equals(N.names(df["business_name"], df["country"]))
+    b = N.names(a["full_name"], df["country"])
+    changed = (a["full_name"] != b["full_name"]).sum()
+    assert changed == 0, a.filter(a["full_name"] != b["full_name"]).head(5)
+    ad = N.addresses(df["business_address"], df["country"])
+    ad2 = N.addresses(ad["addr_norm"], df["country"])
+    assert (ad["addr_norm"] != ad2["addr_norm"]).sum() == 0
+
+
+def test_international_forms_not_applied_to_us_or_india():
+    r = names([("Ramey Spa Inc", "US"), ("Laws Frontier Spa", "US"), ("Sas Nagar Mohali Infratech Pvt Ltd", "India"),
+               ("Rossi Costruzioni S.p.A.", "Italy"), ("Boulangerie Dupont SAS", "France")])
+    assert (r[0]["core_name"], r[0]["legal"]) == ("ramey spa", "inc")
+    assert (r[1]["core_name"], r[1]["legal"]) == ("laws frontier spa", "")
+    assert (r[2]["core_name"], r[2]["legal"]) == ("sas nagar mohali infratech", "pvt ltd")
+    assert (r[3]["core_name"], r[3]["legal"]) == ("rossi costruzioni", "spa")
+    assert (r[4]["core_name"], r[4]["legal"]) == ("boulangerie dupont", "sas")

@@ -1,7 +1,9 @@
 """Learn state aliases from train pairs and measure same-city / same-state agreement of true pairs,
 before (EDA heuristic keys) vs after (normalise.py), per country and match source.
 
-Usage: python src/eval_normalise.py --data-dir data_sample --aliases artifacts/state_aliases.json --out artifacts/normalise_eval.csv
+Usage: python src/eval_normalise.py --data-dir data_sample --split outputs/eda/g25_split.parquet \
+           --aliases artifacts/state_aliases_norm-v1.json --out artifacts/normalise_eval.csv
+Aliases are learned only from pairs of S1 entities that are NOT in the validation split (role != "val").
 """
 import argparse
 import sys
@@ -12,13 +14,14 @@ import polars as pl
 
 sys.path.insert(0, str(Path(__file__).parent))
 import eda  # noqa: E402  (reuses the EDA heuristic keys as the "before" baseline)
-from normalise import Normaliser, learn_state_aliases, save_state_aliases  # noqa: E402
+from normalise import NORM_VERSION, Normaliser, learn_state_aliases, save_state_aliases  # noqa: E402
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-dir", default="data_sample")
-    ap.add_argument("--aliases", default="artifacts/state_aliases.json")
+    ap.add_argument("--split", default="outputs/eda/g25_split.parquet")
+    ap.add_argument("--aliases", default=f"artifacts/state_aliases_{NORM_VERSION}.json")
     ap.add_argument("--out", default="artifacts/normalise_eval.csv")
     a = ap.parse_args()
     t0 = time.time()
@@ -37,8 +40,12 @@ def main() -> None:
     pairs = pairs.join(s1, left_on="s1", right_on="entity_id_1").join(mt, left_on="m", right_on="entity_id_2")
     print(f"{pairs.height:,} true pairs")
 
-    aliases = learn_state_aliases(pairs.select(pl.col("country_1").alias("country"), "addr_1", "addr_2"))
-    save_state_aliases(aliases, a.aliases)
+    val = pl.read_parquet(a.split).filter(pl.col("role") == "val").select(pl.col("source1_entity_id").alias("s1"))
+    learn = pairs.join(val, on="s1", how="anti")
+    print(f"learning aliases from {learn.height:,} pairs (validation S1 excluded: {pairs.height - learn.height:,} pairs)")
+    aliases = learn_state_aliases(learn.select(pl.col("country_1").alias("country"), "addr_1", "addr_2"))
+    save_state_aliases(aliases, a.aliases, {"learned_from": f"{a.data_dir} train pairs, role != val",
+                                            "pairs": learn.height})
     print("learned aliases:", {c: len(m) for c, m in aliases.items()})
     for c, m in aliases.items():
         print(f"  {c}: {dict(list(m.items())[:25])}")

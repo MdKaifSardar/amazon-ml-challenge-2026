@@ -2,8 +2,10 @@
 
 Usage:
   python jobs/build_notebook.py --job eda --script code/business_entity_resolution/src/eda.py \
-      --args "--data-dir /kaggle/input --out-dir /kaggle/working" --no-gpu
-The script source is copied verbatim into one cell, so src/ stays the single source of truth.
+      --args "--data-dir /kaggle/input --out-dir /kaggle/working" --no-gpu \
+      [--modules code/business_entity_resolution/src/normalise.py ...] [--kernel-sources owner/job ...]
+The script source is copied verbatim into one cell, so src/ stays the single source of truth. Modules it
+imports are written to /tmp/src (not /kaggle/working, so they don't end up in the outputs).
 Packages are pip-installed at the versions pinned in the submission requirements.txt.
 """
 import argparse
@@ -32,6 +34,7 @@ def main() -> None:
     ap.add_argument("--args", default="")
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--kernel-sources", nargs="*", default=[])
+    ap.add_argument("--modules", nargs="*", default=[], help="src/ modules the script imports")
     a = ap.parse_args()
 
     pins = [
@@ -45,8 +48,10 @@ def main() -> None:
         "cells": [
             cell("markdown", f"# {a.job}\nGenerated from `{script.relative_to(ROOT)}` by `jobs/build_notebook.py`. Edit the script, not this notebook."),
             cell("code", "!pip install -q " + " ".join(pins)),
-            cell("code", "import os\nfor root, dirs, files in os.walk('/kaggle/input'):\n    print(root, dirs, files)"),
-            cell("code", f"import sys\nsys.argv = {argv!r}"),
+            cell("code", "import os\nos.makedirs('/tmp/src', exist_ok=True)\n"
+                         "for root, dirs, files in os.walk('/kaggle/input'):\n    print(root, dirs, files)"),
+            *[cell("code", f"%%writefile /tmp/src/{Path(m).name}\n" + Path(m).read_text()) for m in a.modules],
+            cell("code", f"import sys\nsys.path.insert(0, '/tmp/src')\nsys.argv = {argv!r}"),
             cell("code", script.read_text()),
         ],
         "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
