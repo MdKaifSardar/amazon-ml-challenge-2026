@@ -18,6 +18,7 @@ def read_tsv_lazy(path: Path) -> pl.LazyFrame:
         separator="\t",
         quote_char='"',
         infer_schema=False,
+        empty_string_is_null=False,
     )
 
 

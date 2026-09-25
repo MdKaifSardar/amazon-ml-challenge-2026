@@ -29,3 +29,7 @@ CLAUDE.md
 context/
 *.pdf
 6ab10eb3b23ba_student_resource/
+
+# Local-only docs (keep private; docs/eda_findings.md is published)
+docs/eda_summary.md
+docs/student_resource_README.md
