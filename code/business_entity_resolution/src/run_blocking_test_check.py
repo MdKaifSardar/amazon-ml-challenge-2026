@@ -25,8 +25,9 @@ try:
 except NameError:  # Kaggle notebook: modules are written to /tmp/src
     sys.path.insert(0, "/tmp/src")
 from candidates import add_list_features, features, prune, rule, score  # noqa: E402
-from run_blocking_eval import COLS, DEFAULT_TARGET, UNIONS, filled_states, find, load_pieces, log, md, to_wide  # noqa: E402
+from run_blocking_eval import COLS, DEFAULT_TARGET, UNIONS, filled_states, find, log, md, to_wide  # noqa: E402
 
+SLICE_ROWS = 10_000_000  # search rows per slice (bounded memory)
 HIST = [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 7), (8, 10), (11, 20), (21, 10**9)]
 
 
@@ -34,7 +35,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--norm-dir", default="artifacts/normalised")
     ap.add_argument("--pieces", nargs="+", required=True, help="folders holding piece_test_* files")
-    ap.add_argument("--model-dir", required=True, help="folder with config.json and pruner_*.pkl of an evaluation")
+    ap.add_argument("--model-dir", required=True, help="folder (searched) with config.json and pruner_*.pkl of an evaluation")
     ap.add_argument("--out-dir", default="artifacts/blocking_test_check")
     a = ap.parse_args()
     out = Path(a.out_dir)
@@ -45,37 +46,60 @@ def main() -> None:
     countries = te[1]["country"].unique().sort().to_list()
 
     # operating point and pruner from the evaluation (chosen on validation, never on test)
-    cfg = json.loads(find(Path(a.model_dir), "config.json").read_text())
+    model_dir = find(Path(a.model_dir), "pruner_state_*.pkl").parent  # the evaluation's output folder (mount paths vary)
+    cfg = json.loads((model_dir / "config.json").read_text())
     op = next(o for o in cfg["operating_points"] if o["target"] == DEFAULT_TARGET and o["scope"] == "state")
     opc = json.loads(op["config"])
     assert op["family"] == "pruned", f"default operating point is not a pruned list: {op}"
     union = opc["union"]
-    with open(find(Path(a.model_dir), f"pruner_state_{union}.pkl"), "rb") as f:
+    with open(model_dir / f"pruner_state_{union}.pkl", "rb") as f:
         model = pickle.load(f)["model"]
     log(f"operating point <= {DEFAULT_TARGET}: {op['config']} (validation recall {op['recall']:.4f} at {op['avg']:.2f})")
 
-    long, timing = load_pieces([Path(d) for d in a.pieces], countries, side="test")
-    wide = to_wide(long.filter(pl.col("scope") == "state"))
-    del long
     tef = filled_states(te, tr, countries)  # same maps as the search (train + test records of the country)
     s1_attr = tef[1].select("entity_id", "core_name", "addr_norm", "city", "state")
     pool_attr = pl.concat([tef[2], tef[3]]).select("entity_id", "core_name", "addr_norm", "city", "state")
-    country_of = te[1].select(pl.col("entity_id").alias("s1"), "country")
+    del tr, te, tef
 
-    base = add_list_features(wide.filter(rule(**UNIONS[union])))
-    p = score(model, base, s1_attr, pool_attr)
-    base = base.with_columns(pl.Series("p_keep", p)).join(country_of, on="s1")
-    kept = prune(base, p, opc["tau"], opc.get("cap"))
-    log(f"test candidates: {base.height:,} in the starting list, {kept.height:,} kept")
+    # one country (piece file) at a time, in S1 slices of <= SLICE_ROWS search rows: every pruner input is
+    # per S1 (list features, S1 best) or carried in the row (pool best), so slicing by S1 is exact.
+    files = sorted({f for d in a.pieces for f in Path(d).rglob("piece_test_*of*.parquet")})
+    timing = [t for f in files for t in json.loads(f.with_name(f.stem + "_timing.json").read_text())]
+    per_s1, psample, feat = [], [], []
+    for f in files:
+        country = json.loads(f.with_name(f.stem + "_timing.json").read_text())[0]["country"]
+        lz = pl.scan_parquet(f).filter(pl.col("scope") == "state")
+        n_parts = max(1, -(-lz.select(pl.len()).collect().item() // SLICE_ROWS))
+        for part in range(n_parts):
+            sub = lz.filter(pl.col("s1").hash(seed=42) % n_parts == part).collect()
+            base = add_list_features(to_wide(sub).filter(rule(**UNIONS[union])))
+            del sub
+            p = score(model, base, s1_attr, pool_attr)
+            base = base.with_columns(pl.Series("p_keep", p))
+            kept = prune(base, p, opc["tau"], opc.get("cap"))
+            per_s1.append(base.group_by("s1").agg(pl.len().alias("n_start"), pl.col("p_keep").max().alias("p_top"))
+                          .join(kept.group_by("s1").len("n_kept"), on="s1", how="left")
+                          .with_columns(pl.col("n_kept").fill_null(0), pl.lit(country).alias("country")))
+            psample.append(base.select("p_keep").sample(min(base.height, 300_000), seed=42).with_columns(pl.lit(country).alias("country")))
+            if part == 0:  # location-feature coverage on a sample of starting-list candidates
+                x = features(base.sample(min(base.height, 500_000), seed=42), s1_attr, pool_attr)
+                feat.append({"country": country, "rows": x.height, "same_state_missing": (x["f_same_state"] == -1).mean(),
+                             "same_city_missing": (x["f_same_city"] == -1).mean(), "same_state_true": (x["f_same_state"] == 1).mean(),
+                             "same_city_true": (x["f_same_city"] == 1).mean(), "name_tsr_median": x["f_name_tsr"].median(),
+                             "addr_tsr_median": x["f_addr_tsr"].median(), "reverse_found": x["rank_reverse"].is_not_null().mean()})
+            log(f"{country} slice {part + 1}/{n_parts}: {base.height:,} starting-list candidates, {kept.height:,} kept")
+            del base, kept, p
+    per_s1, psample, feat = pl.concat(per_s1), pl.concat(psample), pl.DataFrame(feat)
 
     # ---- candidates per S1 (S1 with nothing found count as 0)
-    tim = pl.DataFrame([t for t in timing if t["method"] == "queried"])
-    queried = {r["country"]: r["s1"] for r in tim.iter_rows(named=True)}
+    queried = {t["country"]: t["s1"] for t in timing if t["method"] == "queried"}
     rows, hist = [], []
     for c in countries:
-        for stage, df in (("starting list", base), ("after pruner", kept)):
-            n = df.filter(pl.col("country") == c).group_by("s1").len()["len"].to_numpy()
+        for stage, col in (("starting list", "n_start"), ("after pruner", "n_kept")):
+            n = per_s1.filter(pl.col("country") == c)[col].to_numpy()
             n = np.concatenate([n, np.zeros(max(queried.get(c, 0) - len(n), 0), dtype=np.int64)])
+            if not len(n):
+                continue
             rows.append({"country": c, "stage": stage, "s1_queried": queried.get(c, 0), "avg": n.mean(),
                          "median": float(np.median(n)), "p95": float(np.percentile(n, 95)), "empty_share": (n == 0).mean()})
             if stage == "after pruner":
@@ -83,23 +107,12 @@ def main() -> None:
                                               float(((n >= lo) & (n <= hi)).mean()) for lo, hi in HIST}})
     sizes, hist = pl.DataFrame(rows), pl.DataFrame(hist)
 
-    # ---- pruner scores and location-feature coverage
-    top = base.group_by("country", "s1").agg(pl.col("p_keep").max().alias("p_top"))
+    # ---- pruner scores (all candidates: 300k sample per slice; best candidate per S1: exact)
     q = lambda col, qq: pl.col(col).quantile(qq, "nearest")
-    scores = base.group_by("country").agg(*[q("p_keep", x).alias(f"p_all_q{int(x * 100)}") for x in (0.5, 0.9, 0.99)],
-                                          (pl.col("p_keep") >= opc["tau"]).mean().alias("share_ge_tau")).join(
-        top.group_by("country").agg(*[q("p_top", x).alias(f"p_top1_q{int(x * 100)}") for x in (0.1, 0.25, 0.5)],
-                                    (pl.col("p_top") < opc["tau"]).mean().alias("s1_no_cand_ge_tau")), on="country").sort("country")
-    feat = []
-    for c in countries:
-        smp = base.filter(pl.col("country") == c)
-        smp = smp.sample(min(smp.height, 500_000), seed=42)
-        x = features(smp, s1_attr, pool_attr)
-        feat.append({"country": c, "rows": x.height, "same_state_missing": (x["f_same_state"] == -1).mean(),
-                     "same_city_missing": (x["f_same_city"] == -1).mean(), "same_state_true": (x["f_same_state"] == 1).mean(),
-                     "same_city_true": (x["f_same_city"] == 1).mean(), "name_tsr_median": x["f_name_tsr"].median(),
-                     "addr_tsr_median": x["f_addr_tsr"].median(), "reverse_found": x["rank_reverse"].is_not_null().mean()})
-    feat = pl.DataFrame(feat)
+    scores = psample.group_by("country").agg(*[q("p_keep", x).alias(f"p_all_q{int(x * 100)}") for x in (0.5, 0.9, 0.99)],
+                                             (pl.col("p_keep") >= opc["tau"]).mean().alias("share_ge_tau")).join(
+        per_s1.group_by("country").agg(*[q("p_top", x).alias(f"p_top1_q{int(x * 100)}") for x in (0.1, 0.25, 0.5)],
+                                       (pl.col("p_top") < opc["tau"]).mean().alias("s1_no_cand_ge_tau")), on="country").sort("country")
 
     # ---- states and search groups (from the search pieces)
     src = pl.DataFrame([t for t in timing if t["method"] == "state_src"]).group_by("country", "side_table", "src").agg(
