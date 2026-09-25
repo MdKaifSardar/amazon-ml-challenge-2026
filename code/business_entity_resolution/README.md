@@ -1,6 +1,6 @@
 # Business Entity Resolution pipeline
 
-Status: Phase 1 done (data preparation, EDA, scorer, all-empty baseline); shared normalisation built (norm-v2). Blocking and matching model not built yet.
+Status: Phase 1 done (data preparation, EDA, scorer, all-empty baseline); shared normalisation built (norm-v3). Blocking and matching model not built yet.
 
 ## Setup
 ```bash
@@ -19,8 +19,8 @@ Run all commands below from this folder (`code/business_entity_resolution/`), wi
 4. Normalisation of every source file (state aliases learned from train pairs excluding validation S1, city
    vocabulary from train + test records, quality report). The full data runs on Kaggle (~10 GB RAM):
    `python src/run_normalise.py --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../artifacts/normalised`
-   Outputs `normalised/{split}_source{k}.parquet` (raw + normalised columns), `state_aliases_norm-v2.json`,
-   `city_vocab_norm-v2.parquet` and `normalisation_report.md`. Rules and lists: `docs/normalisation.md`.
+   Outputs `normalised/{split}_source{k}.parquet` (raw + normalised columns), `state_aliases_norm-v3.json`,
+   `city_vocab_norm-v3.parquet` and `normalisation_report.md`. Rules and lists: `docs/normalisation.md`.
 5. All-empty baseline: scores the validation split and writes an all-empty test submission:
    `python src/baseline_empty.py --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../output`
 

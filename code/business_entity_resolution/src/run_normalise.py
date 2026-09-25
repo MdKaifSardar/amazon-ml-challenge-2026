@@ -7,6 +7,7 @@ Outputs (in --out-dir):
   state_aliases_<version>.json           learned aliases with provenance, loaded at inference
   city_vocab_<version>.parquet           (ckey, cand, freq)
   alias_diagnostics.csv, quality.csv, agreement.csv, top_core_tokens.csv, top_legal.csv, examples.csv,
+  effectiveness_summary.csv, effectiveness_auc.csv, effectiveness_hard_negatives.csv,
   normalisation_report.md, manifest.json
 """
 import argparse
@@ -22,6 +23,7 @@ try:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 except NameError:  # inside the Kaggle notebook the modules are written to /tmp/src
     sys.path.insert(0, "/tmp/src")
+from effectiveness import effectiveness  # noqa: E402
 from normalise import (NORM_VERSION, Normaliser, alias_diagnostics, learn_state_aliases,  # noqa: E402
                        merge_city_counts, normalise_records, save_state_aliases)
 
@@ -55,6 +57,7 @@ def main() -> None:
     ap.add_argument("--data-dir", default="data_parquet")
     ap.add_argument("--split", default="outputs/eda/g25_split.parquet", help="split file or folder containing g25_split.parquet")
     ap.add_argument("--out-dir", default="artifacts/normalised")
+    ap.add_argument("--eff-per-country", type=int, default=2000, help="validation S1 per country for the effectiveness check")
     a = ap.parse_args()
     data, out = Path(a.data_dir), Path(a.out_dir)
     (out / "normalised").mkdir(parents=True, exist_ok=True)
@@ -216,6 +219,25 @@ def main() -> None:
                "Full list in `examples.csv`; France and Indian-script rows shown here.\n",
                md(ex.filter((pl.col("country") == "France") | pl.col("business_name").str.contains(NON_LATIN))
                   .select("split", "src", "country", "business_name", "core_name", "legal", "business_address", "city", "state", "dept"), 80) + "\n"]
+
+    # ---- 8. effectiveness on the validation split: raw vs normalised names ----
+    ec = ["entity_id", "country", "business_name", "full_name", "core_name"]
+    summ, aucs, hard = effectiveness(
+        load("train", 1, ec).drop("split", "src"),
+        {f"S{k}": load("train", k, ec).drop("split", "src") for k in (2, 3)},
+        gt, val_ids["s1"], per_country=a.eff_per_country)
+    summ.write_csv(out / "effectiveness_summary.csv")
+    aucs.write_csv(out / "effectiveness_auc.csv")
+    hard.write_csv(out / "effectiveness_hard_negatives.csv")
+    report += ["## 6. Effectiveness on the validation split: raw vs normalised names\n",
+               f"{a.eff_per_country:,} validation S1 per country. raw = lowercased business_name; full = full_name; norm = core_name. "
+               "Hard non-match = most name-similar non-matching record in the same country and source, searched "
+               "separately for each representation.\n",
+               "AUC of name similarity alone (true pairs vs hard non-matches):\n", md(aucs) + "\n",
+               "Distributions (tsr = token_set_ratio, jac3 = char-3gram Jaccard x 100):\n", md(summ, 60) + "\n",
+               "Hardest non-matches under normalisation:\n",
+               md(hard.select("country", "src", "s1_name", "hard_neg_name", "tsr", "jac3"), 40) + "\n"]
+    log("effectiveness done")
 
     report.insert(1, "## Flags\n" + ("\n".join(f"- {f}" for f in flags) if flags else "- none") + "\n")
     (out / "normalisation_report.md").write_text("\n".join(report))

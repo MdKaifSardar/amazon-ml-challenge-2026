@@ -47,7 +47,7 @@ country label. Countries without their own table get only the general rules.
   The full list of rules is in `docs/normalisation.md`.
 - **Effect.** On the full train split, same-city agreement of true pairs is 72.5% (India S2), 89.7% (India S3),
   81.9% (US S2) and 83.3% (US S3). The EDA heuristic gave 45.7% overall and 7.5% for US S3. Same state is
-  98.7–99.9%. Full-data run: Kaggle job `normalise-v2` (24.2M records, 16 min).
+  98.7–99.9%. Full-data run: Kaggle job `normalise-v3` (24.2M records). On validation pairs, normalisation raises name-similarity AUC against the hardest non-match by +0.09–0.12 for India and +0.05 for the US (full_name). Name similarity alone stays ≤ 0.54 AUC, because the data contains same-name businesses and near-duplicate decoys that differ in legal form and house number. Address and legal-form agreement must decide.
 
 ### 2.3 Solution Strategy
 *Outline your high-level approach.*
@@ -69,7 +69,9 @@ country label. Countries without their own table get only the general rules.
 ## 4. Matching Model
 
 **Features used:**
-- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]
+- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]. Planned: similarities on `full_name`,
+  `core_name`, and on the name with all legal words removed at any position (handles noise words after the
+  suffix, "Willow LLC Center"); legal-form agreement.
 - Address features: [e.g., token overlap, edit distance, PIN code matching]
 - Other: []
 

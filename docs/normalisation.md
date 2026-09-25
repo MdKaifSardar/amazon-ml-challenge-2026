@@ -1,4 +1,4 @@
-# Normalisation (`src/normalise.py`, version `norm-v2`)
+# Normalisation (`src/normalise.py`, version `norm-v3`)
 
 This stage cleans every business name and address once. The same code is used for blocking, features and
 inference. It is deterministic, vectorised with polars, and **idempotent**: normalising an output again
@@ -21,7 +21,7 @@ own files, as described in [What is learned from data](#what-is-learned-from-dat
 | `addr_norm` | cleaned address, comma components kept (`12 rue saint honore, 75001 paris`) |
 | `city`, `state`, `dept` | extracted city, state or region (canonical), French département; null when not found |
 | `numbers` | digit tokens from the address, leading zeros removed (`001006` → `1006`) |
-| `norm_version` | `norm-v2`; bump it whenever a rule or list changes (v1 → v2: international legal forms no longer applied to US/India) |
+| `norm_version` | `norm-v3`; bump it whenever a rule or list changes. v1 → v2: international legal forms no longer applied to US/India. v2 → v3: `cie`, Malayalam/Gurmukhi spellings, connector removal |
 
 **Fallbacks.**
 - If `core_name` would be empty (the name is only a legal form, such as "LLC" or "Pvt Ltd"), it falls back to
@@ -64,11 +64,13 @@ own files, as described in [What is learned from data](#what-is-learned-from-dat
   - corp/corporation → `corp`; co/company/cos → `co`
   - ltd/limited → `ltd`; pvt/private → `pvt`; `opc`
 - **International, France and every country without its own table:** `gmbh`, `bv`, `srl`, `spa`, `sl`, `slu`,
-  `sarl`, `sas`, `sasu`, `eurl`, `selarl`, `eirl`, `scop`. These are **not** applied to the US or India, where
-  they are ordinary words ("Ramey Spa Inc" keeps `spa`; "Sas Nagar" is a place).
+  `sarl`, `sas`, `sasu`, `eurl`, `selarl`, `eirl`, `scop`, and `cie` → `co`. These are **not** applied to the US
+  or India, where they are ordinary words ("Ramey Spa Inc" keeps `spa`; "Sas Nagar" is a place).
+- **Connector:** when a legal form is removed, a trailing `and` goes with it ("Smith & Co" → core `smith`,
+  "Elsa & Cie SARL" → core `elsa`; French `et` is mapped to `and` first).
 - **India only.** Transliterated forms seen in S2/S3 after anyascii:
-  - praivet/praibhet/piraivet/praivett/prayvet/pra → `pvt`
-  - limitet/limitedd/li → `ltd`
+  - praivet/praibhet/piraivet/praivett/prayvet/praivrr (Malayalam)/pra → `pvt`
+  - limitet/limitedd/limirrd (Malayalam)/limtid (Gurmukhi)/li → `ltd`
   - elelpi/ellpi → `llp`
   - `pra` and `li` count only as trailing tokens in Indian names.
 - **France only.** Short forms that are ordinary words elsewhere: `sa`, `sci`, `snc`, `ei`, `sca`, `scp`, `gie`,
@@ -84,7 +86,7 @@ leading tokens, repeatedly ("M/s. Smt Kaveri Foods" → `kaveri foods`), and nev
 ### Word abbreviations in names
 - **General (26):** intl, mfg, mfrs, svc/svcs/srvcs, mgmt/mgt, assn, assoc, dept, natl, govt, univ, hosp,
   ctr/cntr/centre, bros, engg/engr, grp, hldgs, inds, sys, solns → full words.
-- **France:** `et` → and, `cie` → company, `st` → saint, `ste` → sainte.
+- **France:** `et` → and, `st` → saint, `ste` → sainte.
 
 ### Address abbreviations
 - **General, all countries (8):** rd → road, ave → avenue, blvd → boulevard, hwy → highway, pkwy → parkway,
@@ -117,8 +119,8 @@ leading tokens, repeatedly ("M/s. Smt Kaveri Foods" → `kaveri foods`), and nev
 
 | What | Learned from | Uses labels? | Where it is stored |
 |---|---|---|---|
-| State aliases (e.g. Devanagari `mharastr` → maharashtra, `krnatk` → karnataka) | **Train true pairs only, excluding S1 entities in the validation split** (`role != "val"` in `g25_split.parquet`); seeded subsample of up to 3M pairs | **Yes** | `state_aliases_norm-v2.json`, with provenance; loaded at inference, never relearned |
-| City frequency vocabulary (which component is the city) | Train + test records of all sources, per country | No | `city_vocab_norm-v2.parquet` |
+| State aliases (e.g. Devanagari `mharastr` → maharashtra, `krnatk` → karnataka) | **Train true pairs only, excluding S1 entities in the validation split** (`role != "val"` in `g25_split.parquet`); seeded subsample of up to 3M pairs | **Yes** | `state_aliases_norm-v3.json`, with provenance; loaded at inference, never relearned |
+| City frequency vocabulary (which component is the city) | Train + test records of all sources, per country | No | `city_vocab_norm-v3.parquet` |
 
 **Alias rules.** A match-side component becomes an alias of state X only when all of these hold:
 - ≥ 30 pairs, and ≥ 90% of them have S1 state X;
@@ -145,10 +147,11 @@ French short legal forms. Tested examples:
 - "Construcciones García S.L." → core `construcciones garcia`, legal `sl`
 - "Calle Mayor 3, Madrid" → city `madrid`
 
-## Known limitation (for review)
+## Known limitation (agreed: handled as a feature)
 
 About 5.7% of names still contain a legal word inside `core_name`. The generator appends noise words after the
 legal form ("Willow LLC Center", "Krishna Best Investment Limited Center"), or reorders it mid-name. The suffix is
-then no longer at an edge, so it is not stripped. Stripping legal words anywhere would also hit real names
-("Andaman Private Fashion"). The planned remedy is at feature level: name similarity computed on tokens with all
-legal words removed, next to `core_name`.
+then no longer at an edge, so it is not stripped. Stripping legal words anywhere in normalisation would also hit
+real names ("Andaman Private Fashion"). **Decision:** normalisation stays as it is. The feature stage adds name
+similarities computed on the tokens with **all** legal words removed (any position), next to the `core_name` and
+`full_name` similarities. The model then learns when that matters.

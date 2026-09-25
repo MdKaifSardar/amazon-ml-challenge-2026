@@ -32,8 +32,8 @@ def addrs(pairs: list[tuple[str, str]], norm: Normaliser = N) -> list[dict]:
     ("T N & Z TÓWING EAST P.C.", "US", "t n and z towing east pc", "t n and z towing east", "pc"),
     ("Jamais Collège SARL", "France", "jamais college sarl", "jamais college", "sarl"),
     ("Bordeaux Jeunes Sasu", "France", "bordeaux jeunes sasu", "bordeaux jeunes", "sasu"),
-    ("Girls Acteurs Cie Participations [SARL]", "France", "girls acteurs company participations sarl",
-     "girls acteurs company participations", "sarl"),
+    ("Girls Acteurs Cie Participations [SARL]", "France", "girls acteurs cie participations sarl",
+     "girls acteurs cie participations", "sarl"),
     ("Deleves Çulturelle SNC", "France", "deleves culturelle snc", "deleves culturelle", "snc"),
 ])
 def test_legal_suffix_full_and_core(raw, country, full, core, legal):
@@ -382,3 +382,30 @@ def test_international_forms_not_applied_to_us_or_india():
     assert (r[2]["core_name"], r[2]["legal"]) == ("sas nagar mohali infratech", "pvt ltd")
     assert (r[3]["core_name"], r[3]["legal"]) == ("rossi costruzioni", "spa")
     assert (r[4]["core_name"], r[4]["legal"]) == ("boulangerie dupont", "sas")
+
+
+# ------------------------------------------------------------------ norm-v3
+
+def test_cie_is_a_legal_form_and_connector_goes_with_it():
+    r = names([("Elsa & Cie SARL", "France"), ("Dupont et Cie", "France"), ("Rossi & Cie", "Belgium"),
+               ("Smith & Co", "US"), ("Brown and Company", "US"), ("Johnson and Johnson", "US")])
+    assert (r[0]["core_name"], r[0]["legal"]) == ("elsa", "co sarl")
+    assert (r[1]["core_name"], r[1]["legal"]) == ("dupont", "co")
+    assert (r[2]["core_name"], r[2]["legal"]) == ("rossi", "co")
+    assert (r[3]["core_name"], r[3]["legal"]) == ("smith", "co")
+    assert (r[4]["core_name"], r[4]["legal"]) == ("brown", "co")
+    assert (r[5]["core_name"], r[5]["legal"]) == ("johnson and johnson", "")
+
+
+def test_cie_not_a_legal_form_in_us_or_india():
+    assert names([("Cie Foods", "US")])[0]["core_name"] == "cie foods"
+    assert names([("Acme Cie", "India")])[0]["legal"] == ""
+
+
+def test_malayalam_and_gurmukhi_limited():
+    r = names([("സായി എനർജി പ്രൈവറ്റ് ലിമിറ്റഡ്", "India"),   # Malayalam "Private Limited" -> praivrr limirrd
+               ("ਅਰਬਨ ਇੰਪੈਕਸ ਲਿਮਟਿਡ", "India"),                 # Gurmukhi "Limited" -> limtid
+               ("Urban Impex Limtid", "India")])
+    assert (r[0]["core_name"], r[0]["legal"]) == ("sayi enrji", "pvt ltd")
+    assert (r[1]["core_name"], r[1]["legal"]) == ("arbn impaiks", "ltd")
+    assert r[2]["legal"] == "ltd"

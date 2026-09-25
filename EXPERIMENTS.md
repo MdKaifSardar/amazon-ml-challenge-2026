@@ -74,4 +74,39 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
       - 5.7% of names keep a legal word inside core_name (noise word after the suffix: "Willow LLC Center").
       - "& Cie" leaves a dangling "and".
       - Gurmukhi "limtid" (Limited) is not in the list.
+- **2026-09-25, norm-v3 + effectiveness check.** Kaggle CPU `normalise-v3` (2783 s: normalisation 1075 s,
+  effectiveness 1708 s; peak 12.1 GB). This is the current version; later jobs use `kernel_sources:
+  sayanchatterjee264/normalise-v3`. Reports are in `outputs/normalise-v3/`.
+  - Changes:
+    - `cie` → co as an international legal form (France and unknown countries).
+    - Trailing `and` removed from core_name when a legal form is stripped ("Elsa & Cie SARL" → elsa,
+      "Smith & Co" → smith).
+    - Malayalam praivrr/limirrd and Gurmukhi limtid added. limirrd was the most common missed Indic spelling
+      (3.6k per 110k Indian-script names).
+    - Unit tests 68/68 pass. No report flags. Aliases and agreement are unchanged from v2.
+  - Effectiveness on the validation split: 2,000 val S1 per country. raw = lowercased name, full = full_name,
+    norm = core_name. The hard non-match is the most name-similar non-matching record in the same country and
+    source, searched over the full pool (2–3M) separately per representation.
+
+    | country | src | AUC tsr raw / full / norm | AUC jac3 raw / full / norm | true pairs tsr<70: raw → norm |
+    |---|---|---|---|---|
+    | India | S2 | 0.313 / 0.386 / 0.407 | 0.268 / 0.353 / 0.389 | 29.7% → 18.8% |
+    | India | S3 | 0.373 / 0.423 / 0.452 | 0.280 / 0.354 / 0.400 | 20.7% → 15.1% |
+    | US | S2 | 0.476 / 0.532 / 0.492 | 0.468 / 0.510 / 0.501 | 9.0% → 7.8% |
+    | US | S3 | 0.482 / 0.539 / 0.499 | 0.446 / 0.488 / 0.468 | 9.7% → 7.9% |
+
+  - Reading:
+    - Normalisation helps: +0.09 to +0.12 AUC for India (transliteration, legal forms), +0.05 for US with
+      full_name. core_name alone is no better than raw for US, because it drops the legal form.
+    - All AUCs are ≤ 0.54: name alone cannot beat the hardest impostor. Its token_set_ratio median is 100 in every
+      group.
+    - A manual check of 16 hard negatives showed two kinds: same-name businesses in other cities (chains, generic
+      names), and deliberate decoys with the same name, a different legal form and a near-identical address (Unit
+      2 vs 9, house 9788 vs 9795, 24 vs 25 Greenwood Ln, extra token "West").
+  - Implications:
+    - Blocking must not rely on name alone.
+    - Features: address, city and house-number agreement; legal-form agreement (same / different / missing); and
+      extra or missing name tokens.
+    - Keep both full_name and core_name similarities (plus the all-legal-words-removed variant agreed for
+      mid-name legal words).
 

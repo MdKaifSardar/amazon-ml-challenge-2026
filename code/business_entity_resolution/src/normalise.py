@@ -27,7 +27,7 @@ import polars as pl
 from anyascii import anyascii
 
 # Bump whenever a rule or list changes; stored in every output so cached artifacts can be checked.
-NORM_VERSION = "norm-v2"  # v2: international legal forms (spa, sas, gmbh, ...) only for France / unknown countries
+NORM_VERSION = "norm-v3"  # v2: international legal forms only for France / unknown countries; v3: cie, Malayalam/Gurmukhi ltd/pvt, no dangling "and"
 
 # ---------------------------------------------------------------------------- basic cleaning
 
@@ -83,13 +83,17 @@ LEGAL_GENERAL = {  # all countries
 LEGAL_INTERNATIONAL = {
     "gmbh": "gmbh", "bv": "bv", "srl": "srl", "spa": "spa", "sl": "sl", "slu": "slu",
     "sarl": "sarl", "sas": "sas", "sasu": "sasu", "eurl": "eurl", "selarl": "selarl", "eirl": "eirl", "scop": "scop",
+    "cie": "co",  # "& Cie" = "& Co"
 }
 LEGAL_BY_COUNTRY = {
     "us": {},
     "india": {
         # transliterations seen in S2/S3 (Devanagari / Tamil / Kannada / Odia -> anyascii), e.g. "pra li" = "pvt ltd"
         "praivet": "pvt", "praibhet": "pvt", "piraivet": "pvt", "praivett": "pvt", "prayvet": "pvt", "pra": "pvt",
+        "praivrr": "pvt",  # Malayalam
         "limitet": "ltd", "limited": "ltd", "limitedd": "ltd", "li": "ltd", "elelpi": "llp", "ellpi": "llp",
+        "limirrd": "ltd",  # Malayalam
+        "limtid": "ltd",  # Gurmukhi
     },
     "france": {"sa": "sa", "sci": "sci", "snc": "snc", "ei": "ei", "sca": "sca", "scp": "scp", "gie": "gie", "scm": "scm"},
 }
@@ -124,7 +128,7 @@ NAME_ABBREV_GENERAL = {
     "centre": "center", "bros": "brothers", "engg": "engineering", "engr": "engineering", "grp": "group",
     "hldgs": "holdings", "inds": "industries", "sys": "systems", "solns": "solutions",
 }
-NAME_ABBREV_BY_COUNTRY = {"france": {"et": "and", "cie": "company", "st": "saint", "ste": "sainte"}}
+NAME_ABBREV_BY_COUNTRY = {"france": {"et": "and", "st": "saint", "ste": "sainte"}}
 
 
 # ---------------------------------------------------------------------------- address rules (language knowledge)
@@ -299,13 +303,18 @@ class Normaliser:
             pl.coalesce(pl.col("_e").str.extract(lead_pat, 2), pl.col("_e")).alias("_rest"),
         )
         g = g.with_columns((pl.lit(" ") + pl.col("_rest")).alias("_s"))
+        core = pl.col("_s").str.extract(tail_pat, 1).fill_null("").str.strip_chars()
         g = g.with_columns(
-            pl.col("_s").str.extract(tail_pat, 1).fill_null("").str.strip_chars().alias("core_name"),
+            core.alias("core_name"),
             pl.concat_str([pl.col("_lead"), pl.col("_s").str.extract(tail_pat, 2).fill_null("")], separator=" ")
             .str.replace_all(r"\s+", " ").str.strip_chars().str.split(" ")
             .list.eval(pl.element().replace(legal)).list.unique(maintain_order=True)  # "pvt ltd ltd" -> "pvt ltd"
             .list.join(" ").str.strip_chars().alias("legal"),
         )
+        # "Smith & Co", "Elsa & Cie SARL", "Dupont et Cie": the connector belongs to the legal form
+        g = g.with_columns(
+            pl.when(pl.col("legal") != "").then(pl.col("core_name").str.replace(r"(?:\s+and)+$", ""))
+            .otherwise(pl.col("core_name")).alias("core_name"))
         full = pl.concat_str([pl.col("core_name"), pl.col("legal")], separator=" ").str.strip_chars()
         g = g.with_columns(full.alias("full_name"))
         # Fallbacks: a name that is only legal tokens ("LLC", "Pvt Ltd") keeps them as its core.
