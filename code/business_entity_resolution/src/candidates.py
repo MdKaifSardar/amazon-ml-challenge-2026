@@ -88,12 +88,11 @@ def feature_cols() -> list[str]:
 
 
 def matrix(x: pl.DataFrame) -> np.ndarray:
+    """Feature matrix; x must carry list_rank / list_size (add_list_features on the whole list)."""
     x = x.with_columns(
         *[(pl.col(f"best_{m}") - pl.col(f"score_{m}")).alias(f"gap_{m}") for m in FORWARD],
         (pl.col("best_reverse") - pl.col("score_reverse")).alias("gap_reverse"),
         pl.sum_horizontal(*[pl.col(f"rank_{m}").is_not_null() for m in METHODS]).alias("n_methods"),
-        pl.col("order").rank("ordinal", descending=True).over("scope", "s1").alias("list_rank"),
-        pl.len().over("scope", "s1").alias("list_size"),
     ).with_columns(*[pl.col(f"rank_{m}").fill_null(RANK_NA) for m in METHODS])
     return x.select(feature_cols()).to_numpy().astype(np.float32)  # NaN (missing score) is handled by the model
 
@@ -102,6 +101,26 @@ def train_pruner(x: pl.DataFrame, y: np.ndarray) -> HistGradientBoostingClassifi
     m = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.1, max_leaf_nodes=31, min_samples_leaf=50,
                                        l2_regularization=1.0, random_state=SEED)
     return m.fit(matrix(x), y)
+
+
+def add_list_features(cand: pl.DataFrame) -> pl.DataFrame:
+    """Per-S1 list features, computed on the WHOLE starting list (before any sampling or chunking)."""
+    return cand.with_columns(pl.col("order").rank("ordinal", descending=True).over("scope", "s1").alias("list_rank"),
+                             pl.len().over("scope", "s1").alias("list_size"))
+
+
+def score(model, cand: pl.DataFrame, s1_attr: pl.DataFrame, pool_attr: pl.DataFrame, chunk: int = 2_000_000) -> np.ndarray:
+    """Pruner probability per row of cand (after add_list_features), in row chunks to bound memory."""
+    return np.concatenate([model.predict_proba(matrix(features(cand[lo:lo + chunk], s1_attr, pool_attr)))[:, 1]
+                           for lo in range(0, cand.height, chunk)] or [np.empty(0)])
+
+
+def training_rows(cand: pl.DataFrame, max_rows: int, seed: int = SEED) -> pl.DataFrame:
+    """All positives plus a seeded sample of negatives, at most max_rows (after add_list_features)."""
+    if cand.height <= max_rows:
+        return cand
+    pos, neg = cand.filter(pl.col("is_match")), cand.filter(~pl.col("is_match"))
+    return pl.concat([pos, neg.sample(max(max_rows - pos.height, 0), seed=seed)])
 
 
 def prune(x: pl.DataFrame, p: np.ndarray, tau: float, cap: int | None = None) -> pl.DataFrame:

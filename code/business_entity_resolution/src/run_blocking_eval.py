@@ -23,6 +23,7 @@ projected time would pass --budget-min are skipped and reported.
 """
 import argparse
 import json
+import pickle
 import re
 import resource
 import sys
@@ -38,15 +39,20 @@ try:
 except NameError:  # Kaggle notebook: modules are written to /tmp/src
     sys.path.insert(0, "/tmp/src")
 import blocking  # noqa: E402
-from blocking import FORWARD, NONE, SCOPES, _pairs_evaluated, block_country, buckets, gpu_info, texts, token_df  # noqa: E402
-from candidates import METHODS, add_best, features, list_stats, matrix, pareto, prune, rule, select, train_pruner  # noqa: E402
+from blocking import (FORWARD, NONE, SCOPES, _pairs_evaluated, block_country, buckets, fill_states, gpu_info,  # noqa: E402
+                      state_maps, texts, token_df)
+from candidates import (METHODS, add_best, add_list_features, feature_cols, features, list_stats, pareto,  # noqa: E402
+                        prune, rule, score, select, train_pruner, training_rows)
 
 SEED = 42
-TARGETS = [5, 10, 20]  # operating points: best recall at <= this many candidates per S1 on average
-COLS = ["entity_id", "country", "business_name", "core_name", "city", "addr_norm", "state"]
+TARGETS = [5, 7, 10, 20]  # operating points: best recall at <= this many candidates per S1 on average (7 = default)
+DEFAULT_TARGET = 7
+COLS = ["entity_id", "country", "business_name", "core_name", "city", "addr_norm", "state", "dept"]
 NON_LATIN = r"[\p{L}&&[^\p{Latin}]]"
 T0 = time.time()
-UNION = dict(rev_m=3, fwd_k=20, rare_k=10)  # generous union the pruner works on
+UNIONS = {"u20": dict(rev_m=3, fwd_k=20, rare_k=10), "u50": dict(rev_m=5, fwd_k=50, rare_k=20)}  # pruner starting lists
+PRUNER_TRAIN_MAX = 6_000_000  # cap on pruner training rows (all positives kept, negatives sampled)
+FEATURE_CHUNK = 2_000_000  # rows per feature/predict chunk (bounded memory)
 
 
 def configs() -> list[tuple[str, dict, int | None]]:
@@ -172,20 +178,70 @@ def plot(curve: pl.DataFrame, front: pl.DataFrame, ops: pl.DataFrame, floor: flo
     plt.close(fig)
 
 
+def bucket_stats(s1: pl.DataFrame, pool: pl.DataFrame) -> list[dict]:
+    """State-bucket facts for one country: where states come from, and the largest within-state search groups
+    (pairs = S1 in the bucket x (pool in the bucket + pool without a state); S1 without a state search everything)."""
+    rows = [{"method": "state_src", "side_table": name, "src": src, "n": n}
+            for name, df in (("s1", s1), ("pool", pool)) for src, n in df["state_src"].value_counts().iter_rows()]
+    sb, pb = s1["state"].fill_null(NONE), pool["state"].fill_null(NONE)
+    ps = dict(pb.value_counts().iter_rows())
+    n_none = ps.get(NONE, 0)
+    grp = [{"bucket": b, "s1": n, "pool": pool.height if b == NONE else ps.get(b, 0) + n_none} for b, n in sb.value_counts().iter_rows()]
+    tot = sum(g["s1"] * g["pool"] for g in grp) or 1
+    for g in sorted(grp, key=lambda g: -g["s1"] * g["pool"])[:5]:
+        rows.append({"method": "bucket", **g, "pairs_share": g["s1"] * g["pool"] / tot})
+    rows.append({"method": "bucket_summary", "n_buckets": len(grp), "pairs": tot, "s1_total": s1.height, "pool_total": pool.height})
+    return rows
+
+
+def to_wide(long: pl.DataFrame) -> pl.DataFrame:
+    """Search results (one row per method hit) -> one row per (scope, S1, candidate) with rank/score per method,
+    the pool record's best reverse score and the S1's best forward score per method (add_best)."""
+    best_rev = (long.filter(pl.col("method") == "reverse").group_by("scope", "s1", "cand")
+                .agg(pl.col("best").max().alias("best_reverse")))
+    wide = long.pivot(on="method", index=["scope", "s1", "cand"], values=["rank", "score"], aggregate_function="min")
+    for mth in METHODS:
+        for c in ("rank", "score"):
+            if f"{c}_{mth}" not in wide.columns:
+                wide = wide.with_columns(pl.lit(None, dtype=pl.Int64 if c == "rank" else pl.Float32).alias(f"{c}_{mth}"))
+    return add_best(wide.join(best_rev, on=["scope", "s1", "cand"], how="left")).sort("scope", "s1", "cand")
+
+
+def filled_states(tr: dict, te: dict, countries: list[str]) -> dict[int, pl.DataFrame]:
+    """tr with missing states inferred per country (same maps as search_piece: learned on train + test records)."""
+    out = {k: [] for k in tr}
+    for country in countries:
+        cc = lambda d: d.filter(pl.col("country") == country)
+        maps = state_maps(pl.concat([cc(t) for t in [*tr.values(), *te.values()]], how="diagonal_relaxed"))
+        for k in tr:
+            out[k].append(fill_states(cc(tr[k]), maps))
+    return {k: pl.concat(v) for k, v in out.items()}
+
+
 def search_piece(a, tr: dict, te: dict, role: pl.DataFrame, country: str, shard: int, n_shards: int, out: Path) -> None:
     """One piece of the search: S1 rows with row % n == shard (forward, rare) and pool rows with row % n == shard
     (reverse). The TF-IDF vocabulary is rebuilt identically in every piece (fixed seed, same corpus), so the union
-    of all n pieces equals one full run. Writes piece_<country>_<i>of<n>.parquet and its timing JSON."""
-    tag = f"piece_{country}_{shard}of{n_shards}"
+    of all n pieces equals one full run. --side train queries the role S1 (validation + pruner train sample) against
+    the train pool; --side test queries a --test-fraction sample of test S1 against the full test pool (no labels).
+    Missing states are inferred from city / dept before bucketing (state_maps, learned on all records of the
+    country, no labels). Writes piece_<side>_<country>_<i>of<n>.parquet and its timing JSON."""
+    tag = f"piece_{a.side}_{country}_{shard}of{n_shards}"
     log(f"{tag}: start")
-    s1 = tr[1].filter(pl.col("country") == country)
-    pool = pl.concat([tr[2].filter(pl.col("country") == country), tr[3].filter(pl.col("country") == country)])
-    test_all = pl.concat([t.filter(pl.col("country") == country) for t in te.values()], how="diagonal_relaxed")
-    train_all = pl.concat([s1, pool])
+    src = tr if a.side == "train" else te
+    cc = lambda d: d.filter(pl.col("country") == country)
+    train_all = pl.concat([cc(t) for t in tr.values()], how="diagonal_relaxed")
+    test_all = pl.concat([cc(t) for t in te.values()], how="diagonal_relaxed")
+    maps = state_maps(pl.concat([train_all, test_all], how="diagonal_relaxed"))
+    s1 = fill_states(cc(src[1]), maps)
+    pool = fill_states(pl.concat([cc(src[2]), cc(src[3])]), maps)
     corpus = {rep: pl.concat([texts(train_all)[rep], texts(test_all)[rep]]) for rep in FORWARD}
     df_counts = token_df(pl.concat([train_all["core_name"], test_all["core_name"]]))
     in_shard = lambda n: np.arange(n) % n_shards == shard
-    wanted = s1["entity_id"].is_in(role["s1"].implode()).to_numpy()
+    if a.side == "train":
+        wanted = s1["entity_id"].is_in(role["s1"].implode()).to_numpy()
+    else:
+        frac = dict(x.split("=") for x in a.test_fraction.split(",")).get(country, "1")
+        wanted = np.random.default_rng(SEED).random(s1.height) < float(frac)
     qmask = wanted & in_shard(s1.height)
     tim: list[dict] = []
     long, _ = block_country(s1, pool, qmask, corpus, df_counts, a.k_max, a.m_max, scopes=tuple(a.scopes),
@@ -195,16 +251,18 @@ def search_piece(a, tr: dict, te: dict, role: pl.DataFrame, country: str, shard:
     long = long.with_columns(pl.Series("s1", s1["entity_id"].to_numpy()[long["qi"].to_numpy()]),
                              pl.Series("cand", pool["entity_id"].to_numpy()[long["pi"].to_numpy()])).drop("qi", "pi")
     long.write_parquet(out / f"{tag}.parquet")
-    (out / f"{tag}_timing.json").write_text(json.dumps([{"country": country, "shard": f"{shard}/{n_shards}", **t} for t in tim]))
+    tim += bucket_stats(s1, pool) + [{"method": "queried", "s1": int(wanted.sum()), "s1_total": s1.height}]
+    (out / f"{tag}_timing.json").write_text(json.dumps([{"country": country, "side": a.side, "shard": f"{shard}/{n_shards}", **t}
+                                                        for t in tim], default=float))
     log(f"{tag}: {long.height:,} rows written")
 
 
-def load_pieces(dirs: list[Path], countries: list[str]) -> tuple[pl.DataFrame, list[dict]]:
-    """Merge piece files; every country needs a complete set 0..n-1 of one n."""
-    files = sorted({f for d in dirs for f in d.rglob("piece_*of*.parquet")})
+def load_pieces(dirs: list[Path], countries: list[str], side: str = "train") -> tuple[pl.DataFrame, list[dict]]:
+    """Merge piece files of one side; every country needs a complete set 0..n-1 of one n."""
+    files = sorted({f for d in dirs for f in d.rglob(f"piece_{side}_*of*.parquet")})
     have: dict[str, dict[int, set[int]]] = {}
     for f in files:
-        c, i, n = re.fullmatch(r"piece_(.+)_(\d+)of(\d+)\.parquet", f.name).groups()
+        c, i, n = re.fullmatch(rf"piece_{side}_(.+)_(\d+)of(\d+)\.parquet", f.name).groups()
         have.setdefault(c, {}).setdefault(int(n), set()).add(int(i))
     for c in countries:
         ok = [n for n, got in have.get(c, {}).items() if got == set(range(n))]
@@ -233,6 +291,9 @@ def main() -> None:
     ap.add_argument("--shard", default="0/1", help="search stage: piece i/n (S1 queries and pool rows split n ways)")
     ap.add_argument("--countries", nargs="*", default=None, help="search stage: countries to search (default all)")
     ap.add_argument("--pieces", nargs="*", default=None, help="evaluate stage: folders holding piece files")
+    ap.add_argument("--side", choices=["train", "test"], default="train", help="search stage: train (labelled) or test")
+    ap.add_argument("--test-fraction", default="France=1,US=0.1,India=0.1",
+                    help="search stage, test side: share of test S1 queried per country (pool is always full)")
     a = ap.parse_args()
     BUDGET_S = a.budget_min * 60
     log(f"search device: {gpu_info()}; scopes {a.scopes}; budget {a.budget_min:.0f} min")
@@ -241,7 +302,7 @@ def main() -> None:
     norm = lambda sp, k, cols=COLS: pl.read_parquet(find(Path(a.norm_dir), f"{sp}_source{k}.parquet", "normalised"), columns=cols)
     split = pl.read_parquet(find(Path(a.split), "g25_split.parquet"))
     tr = {k: norm("train", k) for k in (1, 2, 3)}
-    te = {k: norm("test", k, ["country", "core_name", "city", "addr_norm", "state"]) for k in (1, 2, 3)}
+    te = {k: norm("test", k) for k in (1, 2, 3)}
     present = tr[1]["entity_id"]  # the local sample holds only part of the split
     val_ids = split.filter((pl.col("role") == "val") & pl.col("source1_entity_id").is_in(present.implode()))["source1_entity_id"]
     trn = split.filter((pl.col("role") == "train") & pl.col("source1_entity_id").is_in(present.implode()))["source1_entity_id"]
@@ -259,7 +320,7 @@ def main() -> None:
     shard, n_shards = (int(x) for x in a.shard.split("/"))
     if a.stage in ("all", "search"):
         (out / "pieces").mkdir(exist_ok=True)
-        for country in a.countries or countries:
+        for country in a.countries or (countries if a.side == "train" else te[1]["country"].unique().sort().to_list()):
             search_piece(a, tr, te, role, country, shard, n_shards, out / "pieces")
         if a.stage == "search":
             log("search stage done")
@@ -281,15 +342,8 @@ def main() -> None:
         test_est += test_pairs(te, country, a.scopes)  # includes test-only countries (France)
 
     # ---- one row per (scope, S1, candidate): rank/score per method, reverse best, forward best per S1
-    best_rev = (long.filter(pl.col("method") == "reverse").group_by("scope", "s1", "cand")
-                .agg(pl.col("best").max().alias("best_reverse")))
-    wide = long.pivot(on="method", index=["scope", "s1", "cand"], values=["rank", "score"], aggregate_function="min")
+    wide = to_wide(long)
     del long
-    for mth in METHODS:
-        for c in ("rank", "score"):
-            if f"{c}_{mth}" not in wide.columns:
-                wide = wide.with_columns(pl.lit(None, dtype=pl.Int64 if c == "rank" else pl.Float32).alias(f"{c}_{mth}"))
-    wide = add_best(wide.join(best_rev, on=["scope", "s1", "cand"], how="left"))
     wide = wide.join(truth.select("s1", "cand", pl.lit(True).alias("is_match")), on=["s1", "cand"], how="left").with_columns(
         pl.col("is_match").fill_null(False)).join(role, on="s1").sort("scope", "s1", "cand")  # order-independent of pieces
     log(f"blocking table: {wide.height:,} (scope, S1, cand) rows")
@@ -305,33 +359,48 @@ def main() -> None:
     wv = wide.filter(pl.col("role") == "val")
     tim_rows = []
 
-    # ---- pruner: trained on TRAIN-split S1 candidates of the generous union, applied to validation S1
-    pool_attr = pl.concat([tr[2], tr[3]]).select("entity_id", "core_name", "addr_norm", "city", "state")
-    s1_attr = tr[1].select("entity_id", "core_name", "addr_norm", "city", "state")
-    urule = rule(**UNION)
-    pruned: dict[str, tuple[pl.DataFrame, np.ndarray]] = {}
+    # ---- pruner: trained on TRAIN-split S1 candidates of each starting list (union), applied to validation S1.
+    # Leakage guard: the pruner never sees a validation S1 (asserted), and tau / cap are chosen on the tune half.
+    assert not set(trn_ids.to_list()) & set(val_ids.to_list()), "pruner train S1 overlap validation S1"
+    # features see the same filled states as the buckets (fewer "missing" values, less shift for France)
+    trf = filled_states(tr, te, countries)
+    pool_attr = pl.concat([trf[2], trf[3]]).select("entity_id", "core_name", "addr_norm", "city", "state")
+    s1_attr = trf[1].select("entity_id", "core_name", "addr_norm", "city", "state")
+    pruned: dict[tuple[str, str], tuple[pl.DataFrame, np.ndarray]] = {}
+    audit = []
     if trn_ids.len():
         for sc in a.scopes:
-            t0 = time.time()
-            xt = features(wide.filter((pl.col("scope") == sc) & (pl.col("role") == "train") & urule), s1_attr, pool_attr)
-            xv = features(wv.filter((pl.col("scope") == sc) & urule), s1_attr, pool_attr)
-            t1 = time.time()
-            model = train_pruner(xt, xt["is_match"].to_numpy())
-            t2 = time.time()
-            pv = model.predict_proba(matrix(xv))[:, 1]
-            t3 = time.time()
-            pruned[sc] = (xv.select("scope", "s1", "cand", "is_match"), pv)
-            tim_rows.append({"scope": sc, "method": "pruner", "train_rows": xt.height, "val_rows": xv.height,
-                             "features_s": t1 - t0, "fit_s": t2 - t1, "predict_s": t3 - t2,
-                             "s_per_row": (t1 - t0) / max(xt.height + xv.height, 1) + (t3 - t2) / max(xv.height, 1)})
-            log(f"[{sc}] pruner: {xt.height:,} train rows ({xt['is_match'].mean():.3f} positive), fit {t2 - t1:.0f}s; "
-                f"{xv.height:,} val rows scored")
-            del xt
+            for un, ukw in UNIONS.items():
+                t0 = time.time()
+                ws = add_list_features(wide.filter((pl.col("scope") == sc) & rule(**ukw)))
+                xt = features(training_rows(ws.filter(pl.col("role") == "train"), PRUNER_TRAIN_MAX), s1_attr, pool_attr)
+                t1 = time.time()
+                model = train_pruner(xt, xt["is_match"].to_numpy())
+                t2 = time.time()
+                base = ws.filter(pl.col("role") == "val")
+                pv = score(model, base, s1_attr, pool_attr, FEATURE_CHUNK)
+                t3 = time.time()
+                pruned[(sc, un)] = (base.select("scope", "s1", "cand", "is_match"), pv)
+                with open(out / f"pruner_{sc}_{un}.pkl", "wb") as f:
+                    pickle.dump({"model": model, "features": feature_cols(), "union": ukw, "scope": sc}, f)
+                tim_rows.append({"scope": sc, "method": f"pruner_{un}", "train_rows": xt.height, "val_rows": base.height,
+                                 "features_s": t1 - t0, "fit_s": t2 - t1, "predict_s": t3 - t2,
+                                 "s_per_row": (t3 - t2) / max(base.height, 1)})
+                log(f"[{sc}] pruner {un}: {xt.height:,} train rows ({xt['is_match'].mean():.3f} positive), fit {t2 - t1:.0f}s; "
+                    f"{base.height:,} val rows scored in {t3 - t2:.0f}s")
+                # feature audit: missing-value share of the location features, per country (train rows)
+                xa = xt.join(tr[1].select(pl.col("entity_id").alias("s1"), "country"), on="s1")
+                audit += xa.group_by("country").agg(
+                    pl.lit(sc).alias("scope"), pl.lit(un).alias("union"), pl.len().alias("rows"),
+                    (pl.col("f_same_state") == -1).mean().alias("same_state_missing"),
+                    (pl.col("f_same_city") == -1).mean().alias("same_city_missing"),
+                    pl.col("is_match").mean().alias("positive_share")).to_dicts()
+                del xt, xa, ws
 
     def found_for(sc: str, family: str, config: str) -> pl.DataFrame:
         cfg = json.loads(config)
         if family == "pruned":
-            base, pv = pruned[sc]
+            base, pv = pruned[(sc, cfg["union"])]
             return prune(base, pv, cfg["tau"], cfg.get("cap"))
         cap = cfg.pop("cap", None)
         return select(wv.filter(pl.col("scope") == sc), rule(**cfg), cap)
@@ -344,12 +413,13 @@ def main() -> None:
             found = select(w, rule(**kw), cap).select("s1", "cand")
             name = json.dumps({**{k: v for k, v in kw.items() if v not in (0, None)}, **({"cap": cap} if cap else {})})
             rows += [{"family": fam, "scope": sc, "config": name, **r} for r in list_stats(found, t_tune, s1s_tune, pool_size).iter_rows(named=True)]
-        if sc in pruned:
-            base, pv = pruned[sc]
-            for tau in [0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]:
-                for cap in [None, 3, 5, 10, 20]:
+        for (psc, un), (base, pv) in pruned.items():
+            if psc != sc:
+                continue
+            for tau in [0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3, 0.5]:
+                for cap in [None, 3, 5, 7, 10, 20]:
                     found = prune(base, pv, tau, cap).select("s1", "cand")
-                    name = json.dumps({"union": UNION, "tau": tau, **({"cap": cap} if cap else {})})
+                    name = json.dumps({"union": un, "tau": tau, **({"cap": cap} if cap else {})})
                     rows += [{"family": "pruned", "scope": sc, "config": name, **r}
                              for r in list_stats(found, t_tune, s1s_tune, pool_size).iter_rows(named=True)]
         log(f"[{sc}] configs evaluated")
@@ -405,10 +475,9 @@ def main() -> None:
     grp.write_csv(out / "recall_groups.csv")
 
     # ---- validation candidates of the generous union (with pruner probability) for later stages
-    vc = wv.filter(urule)
-    if pruned:
-        vc = vc.join(pl.concat([b.with_columns(pl.Series("p_keep", p)) for b, p in pruned.values()]).select("scope", "s1", "cand", "p_keep"),
-                     on=["scope", "s1", "cand"], how="left")
+    vc = wv.filter(pl.any_horizontal([rule(**u) for u in UNIONS.values()]))
+    for (sc, un), (b, p) in pruned.items():
+        vc = vc.join(b.select("scope", "s1", "cand", pl.Series(f"p_{un}", p)), on=["scope", "s1", "cand"], how="left")
     vc.write_parquet(out / "val_candidates.parquet")
 
     # ---- timing and test-time estimate
@@ -417,9 +486,11 @@ def main() -> None:
     rate = measured_rates(timing)
     fit = tim.filter(pl.col("method").str.ends_with("_fit_transform") & pl.col("shard").str.starts_with("0/"))  # once per country
     fit_rate = fit["search_s"].sum() / max(fit["pool"].sum() + tr[1].height, 1)
-    prune_rate = float(np.mean([x["s_per_row"] for x in tim_rows])) if tim_rows else 0.0
-    union_avg = {sc: list_stats(wv.filter((pl.col("scope") == sc) & urule).select("s1", "cand"), t, s1s, pool_size)
-                 .filter(pl.col("country") == "ALL")["avg"].item() for sc in a.scopes}
+    prune_rate = float(np.mean([x["s_per_row"] for x in tim_rows])) if tim_rows else 0.0  # features + predict per row
+    dflt = {r["scope"]: json.loads(r["config"]).get("union") for r in ops.filter(
+        (pl.col("country") == "ALL") & (pl.col("target") == DEFAULT_TARGET) & (pl.col("family") == "pruned")).iter_rows(named=True)}
+    union_avg = {sc: list_stats(wv.filter((pl.col("scope") == sc) & rule(**UNIONS[dflt.get(sc, "u20")])).select("s1", "cand"),
+                                t, s1s, pool_size).filter(pl.col("country") == "ALL")["avg"].item() for sc in a.scopes}
     est = pl.DataFrame(test_est).with_columns(
         (pl.col("forward_pairs") * rate.get("forward", 0.0) * len(FORWARD) / 60).alias("forward_min"),
         (pl.col("reverse_pairs") * rate.get("reverse", 0.0) / 60).alias("reverse_min"),
@@ -453,10 +524,15 @@ def main() -> None:
                f"similarity evaluation; searches ran on {'GPU' if blocking.USE_GPU else 'CPU'} ({gpu_info()}). "
                f"Pruner {prune_rate * 1e6:.2f} us per candidate (features + predict).\n",
                "# Test-time estimate (minutes)\n", md(est) + "\n", md(est_tot) + "\n",
+               "# Pruner audit\n",
+               f"Features ({len(feature_cols())}): {', '.join(feature_cols())}. No country, source or language feature. "
+               "Trained only on train-split S1 (asserted disjoint from validation); tau / cap chosen on the tune half.\n",
+               md(pl.DataFrame(audit)) + "\n" if audit else "",
                f"Peak host memory of this run: {peak:.1f} GB.\n"]
     (out / "blocking_report.md").write_text("\n".join(report))
     (out / "config.json").write_text(json.dumps({"operating_points": ops.filter(pl.col("country") == "ALL").select(
-        "scope", "target", "family", "config", "recall", "avg").to_dicts(), "union": UNION, "scopes": a.scopes,
+        "scope", "target", "family", "config", "recall", "avg").to_dicts(), "unions": UNIONS, "default_target": DEFAULT_TARGET,
+        "scopes": a.scopes, "pruner_features": feature_cols(),
         "k_max": a.k_max, "m_max": a.m_max, "device": gpu_info(), "peak_gb": peak}, indent=1))
     log("done: " + "; ".join(f"[{r['scope']}] <= {r['target']}: recall {r['recall']:.4f} at {r['avg']:.2f} cands/S1 ({r['family']})"
                              for r in ops.filter(pl.col("country") == "ALL").iter_rows(named=True)))

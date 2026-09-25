@@ -14,8 +14,9 @@ weight and dominate the cost of the sparse product.
 
 Search scope (a compute split, not a filter):
 - "state": a forward query searches the pool records of its own state plus all pool records without a
-  state; an S1 without a state searches the whole country. The reverse search runs within states only
-  (records without a state are reached by the forward searches).
+  state; an S1 without a state searches the whole country. The reverse search runs within states; a pool
+  record without a state searches all S1 of the country (fallback). Before bucketing, a missing state is
+  inferred from the city, then the dept (state_maps / fill_states, learned from records that have both).
 - "country": every search covers the whole country (affordable on a GPU); recovers pairs whose states
   disagree.
 The rare-token index ignores states in both scopes.
@@ -47,6 +48,7 @@ REVERSE_REP = "name_addr"
 NONE = "__none__"
 ALL = "__all__"
 SCOPES = ("state", "country")
+INFER_MIN_N, INFER_MIN_SHARE = 20, 0.9  # state inference from city / dept (bucket placement only)
 N_THREADS = 4
 
 
@@ -158,6 +160,37 @@ def use_gpu(flag: bool) -> None:
     USE_GPU = bool(flag) and torch is not None and torch.cuda.is_available()
 
 
+def state_maps(records: pl.DataFrame, min_n: int = INFER_MIN_N, min_share: float = INFER_MIN_SHARE) -> dict[str, pl.DataFrame]:
+    """Learn key -> state from records that have both (no labels): for city and for dept, the most frequent state
+    when it covers >= min_share of min_n+ records. Used only to place records without a detected state into a
+    search bucket (a compute split), never as a filter or a feature."""
+    out = {}
+    for key in ("city", "dept"):
+        if key not in records.columns:
+            continue
+        c = (records.filter(pl.col(key).is_not_null() & pl.col("state").is_not_null())
+             .group_by(key, "state").len()
+             .with_columns(pl.col("len").sum().over(key).alias("tot"))
+             .sort(key, "len", "state", descending=[False, True, False])
+             .group_by(key, maintain_order=True).first())
+        out[key] = c.filter((pl.col("tot") >= min_n) & (pl.col("len") / pl.col("tot") >= min_share)).select(
+            key, pl.col("state").alias(f"state_from_{key}"))
+    return out
+
+
+def fill_states(df: pl.DataFrame, maps: dict[str, pl.DataFrame]) -> pl.DataFrame:
+    """state_src = detected / city / dept / none; state = detected, else inferred from city, else from dept."""
+    x = df
+    for key, m in maps.items():
+        x = x.join(m, on=key, how="left")
+    inferred = [pl.col(f"state_from_{k}") for k in maps]
+    src = pl.when(pl.col("state").is_not_null()).then(pl.lit("detected"))
+    for k in maps:
+        src = src.when(pl.col(f"state_from_{k}").is_not_null()).then(pl.lit(k))
+    return x.with_columns(src.otherwise(pl.lit("none")).alias("state_src"),
+                          pl.coalesce(pl.col("state"), *inferred).alias("state")).drop([f"state_from_{k}" for k in maps])
+
+
 def buckets(s1: pl.DataFrame, pool: pl.DataFrame, scope: str) -> tuple[np.ndarray, np.ndarray]:
     if scope == "country":
         return np.full(s1.height, ALL, dtype=object), np.full(pool.height, ALL, dtype=object)
@@ -176,16 +209,18 @@ def forward(Q, q_bucket: np.ndarray, P, p_bucket: np.ndarray, k: int) -> pl.Data
     return pl.concat(out) if out else pl.DataFrame(schema={"qi": pl.Int64, "pi": pl.Int64, "score": pl.Float32, "rank": pl.Int64})
 
 
-def reverse(S, s_bucket: np.ndarray, P, p_bucket: np.ndarray, m: int, keep_s: np.ndarray | None = None) -> pl.DataFrame:
-    """For each pool row with a state: its top-m S1 rows in the same state. Returns (qi = S1 row, pi, score, rank,
+def reverse(S, s_bucket: np.ndarray, P, p_bucket: np.ndarray, m: int, keep_s: np.ndarray | None = None,
+            none_fallback: bool = True) -> pl.DataFrame:
+    """For each pool row: its top-m S1 rows in the same state (pool rows without a state: over all S1 of the
+    country if none_fallback, else skipped). Returns (qi = S1 row, pi, score, rank,
     best), where best is the pool row's top-1 score over ALL S1 (for margin rules). keep_s: optional mask over S1
     rows; only pairs with a kept S1 are returned (all S1 still compete)."""
     out = []
     for b in np.unique(p_bucket):
-        if b == NONE:
+        if b == NONE and not none_fallback:
             continue
         pi = np.flatnonzero(p_bucket == b)
-        si = np.flatnonzero(s_bucket == b)
+        si = np.arange(S.shape[0]) if b == NONE else np.flatnonzero(s_bucket == b)  # no state: whole country
         r, c, s, rk = _topn(P[pi], S[si], m)
         best = np.zeros(len(pi), dtype=np.float32)
         best[r[rk == 1]] = s[rk == 1]
@@ -268,7 +303,7 @@ def block_country(s1: pl.DataFrame, pool: pl.DataFrame, query_mask: np.ndarray, 
                 log(f"  [{sc}] {rep}: forward {time.time() - t2:.0f}s, {pairs:.2e} pairs, {f.height:,} rows")
             if rep == REVERSE_REP:
                 prow = np.arange(P.shape[0]) if pool_mask is None else np.flatnonzero(pool_mask)
-                pairs = _pairs_evaluated(p_bucket[prow][p_bucket[prow] != NONE], s_bucket, with_none=False)
+                pairs = _pairs_evaluated(p_bucket[prow], s_bucket, with_none=False)  # NONE rows: all S1
                 if skip(sc, "reverse", pairs):
                     log(f"  [{sc}] reverse: skipped ({pairs:.2e} pairs over budget)")
                     timing.append({"scope": sc, "method": "reverse", "pairs_evaluated": pairs, "skipped": True})
@@ -278,7 +313,7 @@ def block_country(s1: pl.DataFrame, pool: pl.DataFrame, query_mask: np.ndarray, 
                 r = r.with_columns(pl.Series("pi", prow[r["pi"].to_numpy()], dtype=pl.Int64))  # shard row -> pool row
                 parts.append(r.with_columns(pl.lit(sc).alias("scope"), pl.lit("reverse").alias("method")))  # has "best"
                 timing.append({"scope": sc, "method": "reverse", "search_s": time.time() - t3,
-                               "queries": int((p_bucket[prow] != NONE).sum()), "pool": S.shape[0], "pairs_evaluated": pairs})
+                               "queries": len(prow), "pool": S.shape[0], "pairs_evaluated": pairs})
                 log(f"  [{sc}] reverse: {time.time() - t3:.0f}s, {pairs:.2e} pairs, {r.height:,} rows")
         del S, P
     t5 = time.time()
