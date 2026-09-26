@@ -43,6 +43,10 @@ Run all commands below from this folder (`code/business_entity_resolution/`), wi
      `python src/run_blocking_test_check.py --pieces <dirs> --model-dir <evaluate output>`.
    Kaggle jobs: `blocking-train-india`, `blocking-train-us`, `blocking-test-france`, `blocking-test-usin`,
    `blocking-eval-v3`, `blocking-test-check`. Results are in `EXPERIMENTS.md`.
+7. Pair features (table 6) for train, val and test, one country at a time, with checks (schema, duplicates, inf,
+   NaN share and median per split x country, test-vs-train shift flags) and per-feature AUC on the labelled splits:
+   `python src/run_features.py --input <dir with *_candidates.parquet and normalised/> --out-dir <out> --splits train val test --prune val`
+   (`--prune val`: the blocking-eval-v3 val table is the unpruned starting list; train and test are already pruned).
 
 ## Shared table formats (interfaces between the streams)
 All tables are Parquet with string ids. `s1` = Source 1 entity_id and `cand` = S2/S3 entity_id. The pair key
@@ -55,7 +59,7 @@ everywhere is `(s1, cand)`.
 | 3 | blocking results, long `pieces/piece_{train,test}_{country}_{i}of{n}.parquet` | search jobs | scope, method (name, name_city, name_addr, reverse, rare), score, rank, best (reverse only: the pool record's top-1 score), s1, cand |
 | 4 | candidate table, wide `val_candidates.parquet` (validation S1) | `blocking-eval-v3`; any split via `to_wide()` in `run_blocking_eval.py` | scope, s1, cand, rank_{name,name_city,name_addr,reverse,rare} (null = not found by that method), score_* (same), best_reverse, best_{name,name_city,name_addr} (the S1's top score per method), order (best cosine), is_match (validation only), role, p_u20, p_u50 (pruner probability) |
 | 5 | submitted candidate set (default operating point) | `candidates.prune()` | rows of table 4 in the starting list `u50` with p_u50 >= 0.01, at most 10 per S1 by p_u50 (`config.json` -> operating_points, target 7) |
-| 6 | pair features (stream A -> B) | `features.py` (to build) | s1, cand, f_* (float32; one column per feature, NaN = missing). One file per split: train, val, test. No label column, no country / source / language feature |
+| 6 | pair features (stream A -> B) | `features.py` + `run_features.py` (feat-v2, 86 features) | s1, cand, f_* (float32; one column per feature, NaN = missing). One file per split: train, val, test (rows grouped by S1 country). No label, country or language column. One source feature: `f_cand_is_s3` (1 = S3 candidate, 0 = S2). All counts (name / token frequency, rare words) and the state maps come from ALL train + test records of the country, the same for every split; no feature counts how many S1 lists a candidate is in. No département or postcode feature (they almost never fire). Missing states for `f_state_agree` are filled from the city (blocking's maps; no département → state map is learned on the real data) |
 | 7 | pair scores (B -> selection -> C) | `model.py` (to build) | s1, cand, score (match probability, 0–1) |
 | 8 | selection config (B -> C) | `select.py` (to build) | JSON: model file, threshold, margin, one_to_one (bool), plus the validation F0.5 it was tuned for |
 | 9 | output files | `submission.py` | `matching_results.tsv`, `candidate_pairs.tsv` (spec in the problem statement; candidates = table 5 for test S1) |
@@ -80,5 +84,8 @@ cross-fitted pruner scores.
 - `src/candidates.py`: selection rules, the cheap pruner (features, training, chunked scoring), list statistics.
   Tests in `tests/test_candidates.py`.
 - `src/run_blocking_eval.py`, `src/run_blocking_test_check.py`: blocking evaluation and the test-data France check.
+- `src/features.py`: pair features (table 6): names, rare words, legal form, address (city / state
+  agreement, numbers), blocking scores, per-list context, source flag. Tests in
+  `tests/test_features.py`. `src/run_features.py` runs it per split and country and writes the report.
 - `src/eval_normalise.py`: learns state aliases and reports same-city/same-state agreement of true pairs:
   `python src/eval_normalise.py --data-dir ../../data_sample --aliases ../../artifacts/state_aliases.json`

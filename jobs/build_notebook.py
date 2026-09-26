@@ -34,6 +34,8 @@ def main() -> None:
     ap.add_argument("--args", default="")
     ap.add_argument("--no-gpu", action="store_true")
     ap.add_argument("--kernel-sources", nargs="*", default=[])
+    ap.add_argument("--owner", default="sayanchatterjee264", help="Kaggle user that owns the job")
+    ap.add_argument("--datasets", nargs="*", default=["sayanchatterjee264/amazon-ml-2026"], help="dataset_sources")
     ap.add_argument("--modules", nargs="*", default=[], help="src/ modules the script imports")
     a = ap.parse_args()
 
@@ -63,7 +65,7 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{a.job}.ipynb").write_text(json.dumps(nb, indent=1))
     meta = {
-        "id": f"sayanchatterjee264/{a.job}",
+        "id": f"{a.owner}/{a.job}",
         "title": a.job,
         "code_file": f"{a.job}.ipynb",
         "language": "python",
@@ -71,7 +73,7 @@ def main() -> None:
         "is_private": True,
         "enable_gpu": not a.no_gpu,
         "enable_internet": True,
-        "dataset_sources": ["sayanchatterjee264/amazon-ml-2026"],
+        "dataset_sources": a.datasets,
         "competition_sources": [],
         "kernel_sources": a.kernel_sources,
     }

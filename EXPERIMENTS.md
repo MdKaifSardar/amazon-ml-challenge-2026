@@ -197,7 +197,39 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - India: **93.97%** (390,639 / 415,712; matches 94.0% benchmark).
     - US: **98.80%** (614,067 / 621,555; matches 98.8% benchmark).
   - Pruner separation: True match median p_u50 = 0.9744 vs negative decoy median p_u50 = 0.0731.
-
+- **2026-09-26, pair features feat-v1: code only (stream A, branch `features`; no val F0.5 yet).**
+  - `src/features.py` builds table 6: `s1, cand` + 86 `f_*` float32 columns, NaN = missing, input row order kept.
+    Groups: name 27 (full / core / legal-words-removed-anywhere names), legal form 7, address 22 (city / state /
+    département, numbers), blocking 19, context 11 (name frequency, gap to the best other candidate of the S1).
+    No country, source, language or label column. Unit tests: `tests/test_features.py`, 10/10 pass.
+  - Left out on purpose: candidate popularity (S1 count per candidate). The train / val / test candidate tables
+    cover 300k / 100k / 1.7M S1, so the value would shift between splits.
+  - **Warning for stream B:** `f_p_u50` (the pruner score) and the features derived from it (`f_p_gap`, `f_list_rank`)
+    are **in-sample** for the pruner's own 100k training S1 (train split). Train the model on the other train S1,
+    or drop these columns for those S1.
+- **2026-09-26, feat-v1 sample run, Kaggle CPU `ananyaghosh09/features-sample`** (`src/run_features.py
+  --sample-s1 3000`; 74 s in total, peak 3.9 GB). 3,000 S1 per split, all their candidates.
+  - **The val file is not the pruned set.** `val_candidates.parquet` holds the whole u50 starting list:
+    11,776,475 pairs, 117 per S1, 94% of them with p_u50 < 0.01. `train_candidates.parquet` is already pruned
+    (6.5 per S1, max 10, none below 0.01). Applying the default rule (p_u50 >= 0.01, at most 10 per S1) gives
+    about 7 per S1 on val, which matches the expected 656k pairs.
+  - Speed: 11k pairs/s (plus about 35 s to load records and side statistics).
+  - AUC per feature on the train sample (pruned lists, where the decisions are hard):
+    p_u50 0.96; numbers 0.86–0.94 (long-number shared, jaccard, first number); address 0.79–0.83; legal
+    form 0.70–0.72; names 0.54–0.71. `f_state_same` is 0.50 (blocking is within state), and `f_dept_same` is
+    always NaN (no France in train).
+- **2026-09-26, feat-v1 full run, Kaggle CPU `ananyaghosh09/features-v1`** (`src/run_features.py --prune val`;
+  421 s in total, peak 6.4 GB). Outputs: `features_train.parquet` (1,967,275 pairs, 299,670 S1) and
+  `features_val.parquet` (656,181 pairs, 99,975 S1), each `s1, cand` + 84 `f_*`. Also the report, config and AUC CSVs.
+  - Val pruned to the submitted set: 11,776,475 → 656,181 pairs. Positives 337,282 → 334,945, i.e. 96.85%
+    of the 345,837 true val pairs, the same as the blocking v3 result. Lists now match train: 6.56 per S1
+    (median 6, p95 10, max 10) in both splits.
+  - Train and val AUC per feature agree within 0.005 for every feature, so there is no split shift. No feature is
+    all-NaN.
+  - Strongest features: p_u50 0.96, long-number shared 0.93, number jaccard 0.92, first number equal 0.85,
+    name+address score 0.82, address token set 0.82.
+  - Still no val F0.5: that needs stream B's model. Outputs published as the Kaggle dataset
+    `amazon-ml-2026-features-v1` (created from the notebook output; features_train/val.parquet, report, config).
 - **2026-09-26, Job B: Full test candidate generation on 1.73M test S1** (`code/business_entity_resolution/src/run_blocking_job_b.py`).
   Executed on AWS EC2 `r6i.2xlarge` (8 dedicated vCPUs, 64 GiB RAM), runtime 5,943 s (~99 min).
   Output: `artifacts/blocking_eval/test_candidates.parquet` (12,666,305 rows, 474 MB) and `output/candidate_pairs.tsv` (12,666,305 pairs, 312 MB).
@@ -223,3 +255,69 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
   - `test_candidates.parquet` has exactly the same columns and types as `train_candidates.parquet` (apart from
     the train label `is_match`), so the features code runs on test unchanged.
   - The files are in the `candidates-tsv` notebook output, `output/`.
+- **2026-09-26, feat-v2 code + sample run, Kaggle CPU `ananyaghosh09/features-v2-sample`** (`src/run_features.py
+  --splits train val test --prune val --sample-s1 3000`; 147 s in total, peak 7.5 GB). No model, so no val F0.5.
+  - Changes from feat-v1, agreed with the team:
+    - `f_state_agree` (1 same / 0 different / NaN missing). Missing states are filled with blocking's
+      `state_maps` / `fill_states` (city -> state, then dept -> state), learned per country on all train + test
+      records. On the real data only city maps are learned (see the correction under the full run).
+    - `f_cand_is_s3` (source flag; README table 6 updated).
+    - `f_rare_shared`, `f_rare_only_s1`, `f_rare_only_cand`, `f_rare_shared_idf` (blocking's rare-token definition:
+      document frequency <= 20 in the country, 3+ characters) replace `f_score_rare` / `f_rank_rare` (98% NaN).
+    - All counts (`f_freq_*`, token df for the idf features, rare words) now come from ALL train + test records
+      of the country, the same for every split. No feature counts how many S1 lists a candidate is in (unit test).
+    - Test split: built one country at a time (parts joined with sink_parquet); no-label checks (schema, dtype,
+      duplicates, inf; the job fails otherwise) and NaN share / median per split x country with test-vs-train
+      shift flags (France compared with all train).
+  - Sample (3,000 S1 per split): 90 features at that point, identical float32 schema in every split x country, 0
+    duplicate pairs, 0 inf. Lists 6.5 per S1 (train, val) and 7.3 (test).
+  - How often the new features fire:
+
+    | feature | train | test |
+    |---|---|---|
+    | postcode found, S1 / candidate | 0.08% / 0.09% | 0.20% / 0.15% |
+    | `f_postcode_agree` present | ~0.02% | ~0.07% |
+    | `f_dept_agree` present | 0 | **0 (France included)** |
+    | `f_state_agree` = different (NaN share) | 0.06% (24-25%) | 0.05% (10-18%) |
+    | `f_rare_shared` > 0 | 1.7% | 3.4% |
+
+    - Postcodes (taken by position, not any 5-6 digit token): the data mostly has none. EDA found 5-6 digit numbers
+      in 0% of Indian and 0.3% of French addresses; the US 11% are almost all house numbers at the start ("12345
+      Main St"), which the rule rightly rejects. So feat-v1's long-number features (4%) mostly caught house numbers.
+    - Département: French S1 never has one detected (only S2/S3, ~31%), so `f_dept_agree` never fires.
+  - Shift flags, 38 of 270 feature x country rows. None looks like a bug: France has fewer empty addresses (address
+    NaN ~10% vs 25% in train), fewer blocking methods per candidate (median 2 vs 4), and several 0/1 features flip
+    their median (train lists are ~51% positives; test lists are longer).
+  - **Decision (team): drop `f_dept_agree` and all postcode features** (`f_postcode_agree`, `f_s1_has_postcode`,
+    `f_cand_has_postcode`; `find_postcode` removed).
+    **feat-v2 = 86 features.** Unit tests 93 passed.
+- **2026-09-26, feat-v2 full run, Kaggle CPU `ananyaghosh09/features-v2`** (`src/run_features.py --splits train val
+  test --prune val`; 1,703 s = 28 min in total, peak 13.8 GB during test India). No model, so no val F0.5.
+  Outputs: `features_{train,val,test}.parquet` (`s1, cand` + 86 `f_*` float32), report, profile, shift and AUC CSVs.
+  - Rows: train 1,967,275 (299,670 S1), val 656,181 (99,975 S1; pruned from 11,776,475, positives 334,945 = 96.85%),
+    **test 12,666,305 (1,732,264 S1: France 1,953,139 / India 6,205,439 / US 4,507,727 pairs)**. The 280 test S1
+    without candidates have no rows (the output files keep them as empty lists). Lists: 6.56 per S1 (train, val),
+    7.31 (test); median 6 / 7, p95 10, max 10.
+  - Speed ~9.4-10.1k pairs/s per country (test 22 min); counts + state maps over all 24M records took 22 s.
+  - Checks, every split x country: same 86 columns, order and float32 dtype as train; 0 duplicate pairs; 0 inf;
+    no all-NaN feature.
+  - Train vs val AUC per feature agrees within 0.0025. Strongest are unchanged: p_u50 0.959, number jaccard 0.916,
+    number only-S1 / only-cand 0.12 / 0.13 (inverse), first number equal 0.85.
+  - New features, AUC alone (train): `f_rare_only_cand` 0.553, `f_rare_shared` 0.508, `f_rare_only_s1` 0.498,
+    `f_state_agree` 0.501 (NaN 24%), `f_cand_is_s3` 0.500. Weak on their own, as expected (blocking already
+    searches within a state and by rare tokens); whether they help in combination is for stream B's model.
+  - Test vs train shift flags: 36 of 258 feature x country rows (France 27, India 5, US 4).
+    - France vs all train: fewer empty addresses (address / city / number features NaN 8.5-13.5% vs 24-30%), and
+      the forward name / name+city searches found fewer French candidates (`f_score_name` NaN 42.5% vs 24.6%,
+      `f_score_name_city` 47.1% vs 26.1%; median `f_n_methods` 2 vs 4). So French candidates come more from the
+      name+address / reverse searches. This is a blocking fact, not a feature bug; the model sees NaN there.
+    - India / US: only 0/1 or count features whose median flips (number first-equal, only-S1 / only-cand, last
+      name token), consistent with test lists being longer (7.3 vs 6.6) and so holding a smaller share of matches.
+  - **Correction (state filling):** the log's state maps are city -> state US 20,586 / India 5,031 / France 15
+    and **dept -> state 0 in every country** (no département passes blocking's >= 20 records, >= 90% rule). So
+    missing states come from the city only, and the département plays no part in `f_state_agree`. Earlier notes
+    said it did; they are corrected in the code, README and this log. The published `features_report.md` still
+    carries the old sentence ("the departement still counts through the state filling"); the feature values are
+    unaffected.
+  - Published as the Kaggle dataset `ananyaghosh09/amazon-ml-2026-features-v2` (from the notebook output; all 9
+    files: features_{train,val,test}.parquet, report, config, profile, shift and the two AUC CSVs).

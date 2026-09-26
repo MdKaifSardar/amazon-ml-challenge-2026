@@ -1,0 +1,16 @@
+{
+  "id": "ananyaghosh09/features-v2-sample",
+  "title": "features-v2-sample",
+  "code_file": "features-v2-sample.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "mdkaifsardar/amazon-ml-2026-blocking-v3",
+    "sayanchatterjee264/normalize-v3-features"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}
