@@ -15,8 +15,9 @@ Groups:
 1. name: similarities on full_name, core_name and `nolegal` (legal words removed at ANY position, the agreed fix
    for "Willow LLC Center"); first/last token, extra tokens, IDF-weighted overlap, rarest differing token.
 2. legal form: agreement of the edge legal form (`legal`) and of legal words found anywhere in the name.
-3. address: fuzzy similarities, city / state / département agreement, city found in the other address,
-   number tokens (shared, conflicting, first/last, long 5+ digit tokens such as postcodes).
+3. address: fuzzy similarities, city agreement, city found in the other address, number tokens (shared,
+   conflicting, first/last, long 5+ digit tokens such as postcodes). No state / département agreement: blocking
+   searches within the state (always equal in train), and train has no département (France is test-only).
 4. blocking: scores, ranks, gaps to the S1's best, number of methods, pruner score and list position.
 5. context: name frequency in the side's files; the pair's value minus the best OTHER candidate of the same S1;
    duplicates of the candidate's name in the S1's list.
@@ -36,7 +37,7 @@ from normalise import _legal_for
 FEATURE_VERSION = "feat-v1"
 METHODS = ("name", "name_city", "name_addr", "reverse", "rare")
 FORWARD = ("name", "name_city", "name_addr")
-REC_COLS = ("entity_id", "country", "full_name", "core_name", "legal", "addr_norm", "city", "state", "dept", "numbers")
+REC_COLS = ("entity_id", "country", "full_name", "core_name", "legal", "addr_norm", "city", "numbers")
 TRAILING_ONLY = {"pra", "li"}  # Indian legal spellings that are legal only as a trailing token (normalisation rule)
 NAME_VARIANTS = ("full", "core", "nolegal")
 LONG_NUM = 5  # digit tokens this long are postcodes (US ZIP, Indian PIN, French CP) or long house numbers
@@ -197,8 +198,7 @@ def _address_features(q: dict, p: dict) -> list[pl.Series]:
            _f32("f_addr_partial", _fuzzy(fuzz.partial_ratio, a, b)),
            _f32("f_addr_tok_jacc", _jaccard(a, b, 0)),
            _f32("f_addr_c3_jacc", _jaccard(a, b, 3)),
-           _f32("f_city_same", _eq(qc, pc)), _f32("f_city_ratio", city_fz), _f32("f_city_in_addr", city_in),
-           _f32("f_state_same", _eq(q["state"], p["state"])), _f32("f_dept_same", _eq(q["dept"], p["dept"]))]
+           _f32("f_city_same", _eq(qc, pc)), _f32("f_city_ratio", city_fz), _f32("f_city_in_addr", city_in)]
     n = len(a)
     cols = {k: np.full(n, np.nan, np.float32) for k in
             ("n_s1", "n_cand", "shared", "only_s1", "only_cand", "jacc", "first_eq", "last_eq", "long_shared", "long_conflict")}
@@ -240,7 +240,7 @@ def _blocking_features(x: pl.DataFrame) -> list[pl.Expr]:
 def row_features(pairs: pl.DataFrame, s1_rec: pl.DataFrame, pool_rec: pl.DataFrame, stats: PoolStats) -> pl.DataFrame:
     """Per-pair features that need only the pair itself (safe to compute in row chunks). Keeps pairs' order and
     carries q_core / p_core for the context step."""
-    cols = ("full_name", "core_name", "nolegal", "legal", "legal_any", "addr_norm", "city", "state", "dept", "numbers")
+    cols = ("full_name", "core_name", "nolegal", "legal", "legal_any", "addr_norm", "city", "numbers")
     x = (pairs.select("s1", "cand").with_row_index("_i")
          .join(s1_rec.select(pl.col("entity_id").alias("s1"), *[pl.col(c).alias(f"q_{c}") for c in cols]), on="s1", how="left")
          .join(pool_rec.select(pl.col("entity_id").alias("cand"), *[pl.col(c).alias(f"p_{c}") for c in cols]), on="cand", how="left")

@@ -54,7 +54,7 @@ def test_schema_order_and_dtype(feats):
     assert feats.select("s1", "cand").equals(PAIRS.select("s1", "cand"))
     names = feature_names(feats)
     assert names and all(feats.schema[c] == pl.Float32 for c in names)
-    assert not any(w in c for c in feats.columns for w in ("country", "source", "is_match", "lang"))
+    assert not any(w in c for c in feats.columns for w in ("country", "source", "is_match", "lang", "state", "dept"))
 
 
 def test_nolegal_handles_mid_name_legal_word(feats):
@@ -75,14 +75,14 @@ def test_house_number_decoy(feats):
     a, b = row(feats, "S2-a"), row(feats, "S3-b")
     assert a["f_num_first_eq"] == 1 and b["f_num_first_eq"] == 0
     assert a["f_num_long_shared"] == 1 and a["f_num_long_conflict"] == 0
-    assert a["f_city_same"] == 1 and a["f_state_same"] == 1
+    assert a["f_city_same"] == 1
     assert a["f_ctx_num_jacc"] > 0 and b["f_ctx_num_jacc"] < 0  # better / worse than the other candidate
 
 
 def test_empty_address_gives_nan_not_zero(feats):
     r = row(feats, "S2-c")
     assert r["f_addr_missing"] == 1
-    for c in ("f_addr_ratio", "f_addr_tsr", "f_city_same", "f_state_same", "f_num_jacc", "f_num_first_eq"):
+    for c in ("f_addr_ratio", "f_addr_tsr", "f_city_same", "f_num_jacc", "f_num_first_eq"):
         assert math.isnan(r[c]), c
     assert r["f_num_n_cand"] == 0
     assert r["f_name_core_ratio"] == pytest.approx(1.0) and r["f_legal_same"] == 1  # private limited = pvt ltd
@@ -121,3 +121,20 @@ def test_missing_record_raises():
     stats = pool_stats(S1["core_name"], POOL["core_name"])
     with pytest.raises(ValueError):
         build(PAIRS.with_columns(pl.lit("S2-zz").alias("cand")).head(1), S1, POOL, stats)
+
+
+def test_prune_standard_matches_default_operating_point():
+    from run_features import prune_standard
+    cfg = {"default_target": 7, "unions": {"u50": {"rev_m": 5, "fwd_k": 50, "rare_k": 20}},
+           "operating_points": [{"target": 7, "config": '{"union": "u50", "tau": 0.01, "cap": 10}'}]}
+    cols = {"scope": pl.Utf8, "s1": pl.Utf8, "cand": pl.Utf8, "p_u50": pl.Float64,
+            **{f"rank_{m}": pl.Int64 for m in ("name", "name_city", "name_addr", "reverse", "rare")}}
+    rows = [("state", "a", f"S2-{i:02d}", 0.5 + i / 100, i + 1, None, None, None, None) for i in range(12)]  # 12 above tau
+    rows += [("state", "a", "S2-low", 0.005, 1, None, None, None, None),  # below tau
+             ("state", "a", "S2-far", None, 60, None, None, None, None),  # outside u50 (fwd rank 60), no p_u50
+             ("state", "b", "S3-rev", 0.02, None, None, None, 5, None)]  # reverse rank 5 is in u50
+    c = pl.DataFrame(rows, schema=cols, orient="row")
+    out = prune_standard(c, cfg)
+    assert set(out.filter(pl.col("s1") == "a")["cand"]) == {f"S2-{i:02d}" for i in range(2, 12)}  # top 10 by p_u50
+    assert out.filter(pl.col("s1") == "b")["cand"].to_list() == ["S3-rev"]
+    assert "p_keep" not in out.columns
