@@ -192,3 +192,14 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
   - **Warning for stream B:** `f_p_u50` (the pruner score) and the features derived from it (`f_p_gap`, `f_list_rank`)
     are **in-sample** for the pruner's own 100k training S1 (train split). Train the model on the other train S1,
     or drop these columns for those S1.
+- **2026-09-26, feat-v1 sample run, Kaggle CPU `ananyaghosh09/features-sample`** (`src/run_features.py
+  --sample-s1 3000`; 74 s in total, peak 3.9 GB). 3,000 S1 per split, all their candidates.
+  - **The val file is not the pruned set.** `val_candidates.parquet` holds the whole u50 starting list:
+    11,776,475 pairs, 117 per S1, 94% of them with p_u50 < 0.01. `train_candidates.parquet` is already pruned
+    (6.5 per S1, max 10, none below 0.01). Applying the default rule (p_u50 >= 0.01, at most 10 per S1) gives
+    about 7 per S1 on val, which matches the expected 656k pairs.
+  - Speed: 11k pairs/s (plus about 35 s to load records and side statistics).
+  - AUC per feature on the train sample (pruned lists, where the decisions are hard):
+    p_u50 0.96; numbers 0.86–0.94 (long-number shared, jaccard, first number); address 0.79–0.83; legal
+    form 0.70–0.72; names 0.54–0.71. `f_state_same` is 0.50 (blocking is within state), and `f_dept_same` is
+    always NaN (no France in train).
