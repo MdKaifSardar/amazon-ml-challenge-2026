@@ -9,7 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from features import (build, count_stats, country_state_maps, feature_names, fill_record_states,  # noqa: E402
-                      find_postcode, legal_words, prepare_records)
+                      legal_words, prepare_records)
 
 REC_SCHEMA = {"entity_id": pl.Utf8, "country": pl.Utf8, "business_address": pl.Utf8, "full_name": pl.Utf8, "core_name": pl.Utf8, "legal": pl.Utf8,
               "addr_norm": pl.Utf8, "city": pl.Utf8, "state": pl.Utf8, "dept": pl.Utf8, "numbers": pl.List(pl.Utf8)}
@@ -76,7 +76,6 @@ def test_legal_agreement(feats):
 def test_house_number_decoy(feats):
     a, b = row(feats, "S2-a"), row(feats, "S3-b")
     assert a["f_num_first_eq"] == 1 and b["f_num_first_eq"] == 0
-    assert a["f_postcode_agree"] == 1 and a["f_s1_has_postcode"] == 1 and a["f_cand_has_postcode"] == 1
     assert a["f_city_same"] == 1
     assert a["f_ctx_num_jacc"] > 0 and b["f_ctx_num_jacc"] < 0  # better / worse than the other candidate
 
@@ -95,7 +94,7 @@ def test_france_works_without_labels_or_country_rules(feats):
     r = row(feats, "S3-d")
     assert r["f_name_full_ratio"] == pytest.approx(1.0) and r["f_legal_same"] == 1
     assert math.isnan(r["f_city_same"]) and r["f_city_in_addr"] == 1  # "paris" appears in the candidate's address
-    assert r["f_num_first_eq"] == 1 and math.isnan(r["f_postcode_agree"]) and r["f_cand_has_postcode"] == 0  # candidate has no postcode
+    assert r["f_num_first_eq"] == 1
 
 
 def test_blocking_features(feats):
@@ -152,45 +151,15 @@ def frame(rows):
     return pl.DataFrame(rows, schema=REC_SCHEMA, orient="row")
 
 
-@pytest.mark.parametrize("components, city, expected", [
-    (["24 greenwood ln", "austin", "tx 78701"], "austin", "78701"),  # ends a component after a state word
-    (["24 greenwood ln austin tx 78701"], "austin", "78701"),  # no commas
-    (["12345 main st", "austin", "tx 78701 1234"], "austin", "78701"),  # ZIP+4; the house number is not a ZIP
-    (["12345 main st austin tx"], "austin", None),  # house number only: first token of the address
-    (["12345 broadway"], None, None),
-    (["suite 12345", "100 main st", "austin tx"], "austin", None),  # after a unit word
-    (["po box 12345", "austin"], "austin", None),
-    (["plot no 123456", "bengaluru"], "bengaluru", None),
-    (["unit 5", "12345 main st", "austin"], "austin", None),  # starts a later component, but a street follows
-    (["no 12 mg road", "bengaluru", "karnataka 560001", "india"], "bengaluru", "560001"),  # trailing country ignored
-    (["12 rue x", "02100 saint quentin", "france"], None, "02100"),  # starts a place-name component; zero kept
-    (["12 rue saint honore 02100 saint quentin"], "saint quentin", "02100"),  # right before the city
-    (["12 r saint honore", "paris"], "paris", None),
-    ([], None, None),
-])
-def test_find_postcode_by_position(components, city, expected):
-    assert find_postcode(components, city) == expected
+def test_no_postcode_or_dept_features(feats):
+    """Dropped after features-v2-sample: they almost never fire on real data."""
+    assert not any(k in feats.columns for k in ("f_dept_agree", "f_postcode_agree", "f_s1_has_postcode",
+                                                "f_cand_has_postcode", "f_num_long_shared", "f_num_long_conflict"))
 
 
-def test_prepare_records_postcode_from_raw_address_keeps_leading_zero():
-    rec = prepare_records(frame([raw("S2-x", "France", "3 Rue Pasteur, 02100 Saint-Quentin", "cafe", city="saint quentin"),
-                                 raw("S2-y", "US", "12345 Main St, Austin, TX", "cafe", city="austin"),
-                                 raw("S2-z", "India", "Shop 4, MG Road, Pune - 411001", "cafe", city="pune")]))
-    assert dict(zip(rec["entity_id"], rec["postcode"])) == {"S2-x": "02100", "S2-y": None, "S2-z": "411001"}
-    assert "business_address" not in rec.columns
-    assert S1.filter(pl.col("entity_id") == "S1-1")["postcode"][0] == "78701"
-
-
-def test_postcode_features(feats):
-    a, c, d = row(feats, "S2-a"), row(feats, "S2-c"), row(feats, "S3-d")
-    assert (a["f_postcode_agree"], a["f_s1_has_postcode"], a["f_cand_has_postcode"]) == (1, 1, 1)
-    assert math.isnan(c["f_postcode_agree"]) and c["f_s1_has_postcode"] == 1 and c["f_cand_has_postcode"] == 0
-    assert d["f_s1_has_postcode"] == 1 and d["f_cand_has_postcode"] == 0  # "75001 paris" starts a place component
-    assert not any(k.startswith("f_num_long") for k in feats.columns)
-
-
-def test_state_filled_like_blocking_and_dept_agreement():
-    # 25 records with city + state teach "saint quentin" -> hauts de france (blocking: >= 20 records, >= 90%).
+def test_state_filled_like_blocking_from_city_and_dept():
+    # 25 records with city + state teach "saint quentin" -> hauts de france and aisne -> hauts de france
+    # (blocking: >= 20 records, >= 90%).
     loc = pl.DataFrame({"country": ["France"] * 25 + ["US"] * 25, "city": ["saint quentin"] * 25 + ["austin"] * 25,
                         "dept": ["aisne"] * 25 + [None] * 25, "state": ["hauts de france"] * 25 + ["texas"] * 25})
     maps = country_state_maps(loc)
@@ -203,19 +172,21 @@ def test_state_filled_like_blocking_and_dept_agreement():
         raw("S2-f1", "France", "1 rue x, saint quentin", "cafe du nord", "saint quentin", None, "aisne"),  # state from city
         raw("S3-f2", "France", "1 rue x, lille", "cafe du nord", "lille", "hauts de france", "nord"),  # other dept
         raw("S2-f3", "France", "1 rue x", "cafe du nord"),  # no city, state or dept
+        raw("S3-f4", "France", "1 rue x, bourg", "cafe du nord", "bourg", None, "aisne"),  # state from the dept
         raw("S3-u1", "US", "1 main st, austin", "cafe du nord", "austin", None),  # state from city
         raw("S2-u2", "US", "1 main st, dallas, tx", "cafe du nord", "dallas", "oklahoma"),  # different state
     ]), maps))
     assert pool.filter(pl.col("entity_id") == "S2-f1")["state"][0] == "hauts de france"
+    assert pool.filter(pl.col("entity_id") == "S3-f4")["state"][0] == "hauts de france"
     assert "state_src" not in pool.columns
-    pairs = pl.DataFrame({"s1": ["S1-f"] * 3 + ["S1-u"] * 2, "cand": ["S2-f1", "S3-f2", "S2-f3", "S3-u1", "S2-u2"]})
+    pairs = pl.DataFrame({"s1": ["S1-f"] * 4 + ["S1-u"] * 2, "cand": ["S2-f1", "S3-f2", "S2-f3", "S3-f4", "S3-u1", "S2-u2"]})
     x = build(pairs, s1, pool, count_stats([s1], [pool]))
     st = dict(zip(x["cand"], x["f_state_agree"].to_list()))
-    dp = dict(zip(x["cand"], x["f_dept_agree"].to_list()))
-    assert st["S2-f1"] == 1 and st["S3-f2"] == 1 and math.isnan(st["S2-f3"]) and st["S3-u1"] == 1 and st["S2-u2"] == 0
-    assert dp["S2-f1"] == 1 and dp["S3-f2"] == 0 and math.isnan(dp["S2-f3"])
-    assert math.isnan(dp["S3-u1"]) and math.isnan(dp["S2-u2"])  # no departement outside France: all-NaN in train
-    assert dict(zip(x["cand"], x["f_cand_is_s3"].to_list())) == {"S2-f1": 0, "S3-f2": 1, "S2-f3": 0, "S3-u1": 1, "S2-u2": 0}
+    assert st["S2-f1"] == 1 and st["S3-f2"] == 1 and math.isnan(st["S2-f3"]) and st["S3-f4"] == 1
+    assert st["S3-u1"] == 1 and st["S2-u2"] == 0
+    assert "f_dept_agree" not in x.columns
+    assert dict(zip(x["cand"], x["f_cand_is_s3"].to_list())) == {"S2-f1": 0, "S3-f2": 1, "S2-f3": 0, "S3-f4": 1, "S3-u1": 1,
+                                                                 "S2-u2": 0}
 
 
 def test_rare_word_features_use_blocking_definition():
@@ -261,9 +232,8 @@ def test_features_do_not_depend_on_other_s1_lists(feats):
 
 def test_feature_count_and_names(feats):
     names = feature_names(feats)
-    assert len(names) == 90 and len(set(names)) == 90
-    for f in ("f_state_agree", "f_dept_agree", "f_cand_is_s3", "f_postcode_agree", "f_s1_has_postcode",
-              "f_cand_has_postcode", "f_rare_shared", "f_rare_only_s1", "f_rare_only_cand", "f_rare_shared_idf"):
+    assert len(names) == 86 and len(set(names)) == 86
+    for f in ("f_state_agree", "f_cand_is_s3", "f_rare_shared", "f_rare_only_s1", "f_rare_only_cand", "f_rare_shared_idf"):
         assert f in names, f
 
 

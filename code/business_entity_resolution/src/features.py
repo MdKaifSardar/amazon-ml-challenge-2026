@@ -20,9 +20,11 @@ Groups:
 2. rare words: core-name tokens that are rare in the country (document frequency <= RARE_DF and 3+ characters,
    the definition of blocking's rare-token search): shared, only on one side, and how rare the rarest shared one is.
 3. legal form: agreement of the edge legal form (`legal`) and of legal words found anywhere in the name.
-4. address: fuzzy similarities; city / state / département agreement (state filled in from city or département
-   as in blocking; département is France-only, so all-NaN in train); city found in the other address; number
-   tokens (shared, conflicting, first/last); postcode taken by position (see find_postcode).
+4. address: fuzzy similarities; city and state agreement (missing states filled in from the city, then the
+   département, as in blocking); city found in the other address; number tokens (shared, conflicting,
+   first/last). No département or postcode feature: on real data they almost never fire (features-v2-sample:
+   French S1 never has a département; 5-6 digit postcodes are in ~0.1% of addresses, most such numbers being
+   US house numbers). The département still counts through the state filling.
 5. blocking: scores, ranks, gaps to the S1's best, number of methods, pruner score and list position. The rare
    method's score/rank are left out (98% NaN, no signal); the rare-word group replaces them.
 6. context: name frequency in the country; the pair's value minus the best OTHER candidate of the same S1;
@@ -33,7 +35,6 @@ Groups:
 from __future__ import annotations
 
 import math
-import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -43,27 +44,17 @@ from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
 from blocking import RARE_DF, fill_states, state_maps
-from normalise import STREET_WORDS, _clean, _legal_for, transliterate
+from normalise import _legal_for
 
 FEATURE_VERSION = "feat-v2"
 METHODS = ("name", "name_city", "name_addr", "reverse", "rare")
 SCORED = ("name", "name_city", "name_addr", "reverse")  # rare score/rank dropped in v2 (see group 5)
 FORWARD = ("name", "name_city", "name_addr")
-REC_COLS = ("entity_id", "country", "business_address", "full_name", "core_name", "legal", "addr_norm", "city",
-            "state", "dept", "numbers")
+REC_COLS = ("entity_id", "country", "full_name", "core_name", "legal", "addr_norm", "city", "state", "numbers")
 TRAILING_ONLY = {"pra", "li"}  # Indian legal spellings that are legal only as a trailing token (normalisation rule)
 NAME_VARIANTS = ("full", "core", "nolegal")
 RARE_MIN_LEN = 3  # blocking.rare_tokens: rare tokens have df <= RARE_DF and at least 3 characters
 CONTEXT = ("f_name_core_tsr", "f_name_core_ratio", "f_name_idf_jacc", "f_addr_tsr", "f_addr_c3_jacc", "f_num_jacc")
-
-# Postcode by position. A 5-6 digit token is a postcode only where postcodes sit, never where house numbers sit.
-POSTCODE_RE = re.compile(r"^\d{5,6}$")
-UNIT_WORDS = {"no", "nos", "number", "plot", "unit", "suite", "ste", "apt", "apartment", "flat", "box", "pmb", "door",
-              "house", "room", "rm", "block", "blk", "shop", "office", "lot", "survey", "khasra", "sector", "ward",
-              "floor", "fl", "building", "bldg", "gali"}  # "suite 12345", "po box 12345", "plot no 123456"
-COUNTRY_TAIL = {"india", "bharat", "usa", "us", "america", "united", "states", "of", "france"}
-STREET_RE = re.compile(STREET_WORDS + r"|\b(st|rd|ave|av|dr|ln|blvd|bd|hwy|pkwy|ct|cir|pl|place|sq|ter|trl|pike|plaza|"
-                       r"marg|rte|chem|imp|bis)\b")
 
 
 # ---------------------------------------------------------------------------- records, states and counts
@@ -72,44 +63,6 @@ def legal_words(country: str | None) -> dict[str, str]:
     """Legal word -> canonical form for this country, for removal at any position (trailing-only forms excluded)."""
     table = _legal_for((country or "").strip().lower())
     return {w: c for w, c in table.items() if w not in TRAILING_ONLY}
-
-
-def find_postcode(components: list[str], city: str | None) -> str | None:
-    """The address's postcode (digits as written, leading zeros kept), or None. components = the address split on
-    commas, each cleaned (lowercase ASCII, punctuation -> space). A 5-6 digit token counts only by position:
-    - it ends its comma component, after a name word ("austin tx 78701", "bengaluru 560001", "..., 75001") and not
-      after a unit word ("suite 12345", "po box 12345"); or
-    - it is followed by the address's city ("12 rue x 02100 saint quentin"); or
-    - it starts a later component whose rest is a place name ("..., 75001 paris").
-    Never the very first token of the address, where US house numbers sit ("12345 main st").
-    ZIP+4 ("78701 1234") keeps the 5-digit part; trailing country words are ignored. When several qualify, the
-    last one wins."""
-    city_toks = (city or "").split()
-    best, first = None, True
-    for comp in components:
-        toks = comp.split()
-        while toks and toks[-1] in COUNTRY_TAIL:
-            toks.pop()
-        if len(toks) >= 2 and len(toks[-1]) == 4 and toks[-1].isdigit() and len(toks[-2]) == 5 and toks[-2].isdigit():
-            toks.pop()  # ZIP+4
-        for j, t in enumerate(toks):
-            if first and j == 0 or not POSTCODE_RE.match(t):
-                continue
-            rest = toks[j + 1:]
-            ends = j == len(toks) - 1 and (j == 0 or toks[j - 1] not in UNIT_WORDS)
-            before_city = bool(city_toks) and rest[:len(city_toks)] == city_toks
-            place = j == 0 and bool(rest) and not any(c.isdigit() for c in "".join(rest)) and not STREET_RE.search(" ".join(rest))
-            if ends or before_city or place:
-                best = t
-        if toks:
-            first = False
-    return best
-
-
-def _postcodes(addr: pl.Series, city: pl.Series) -> pl.Series:
-    comps = (transliterate(addr).str.split(",")
-             .list.eval(_clean(pl.element(), drop_dots=False)).to_list())
-    return pl.Series("postcode", [find_postcode(c or [], k) for c, k in zip(comps, city.to_list())], dtype=pl.String)
 
 
 def country_state_maps(loc: pl.DataFrame) -> dict[str, dict[str, pl.DataFrame]]:
@@ -126,13 +79,11 @@ def fill_record_states(rec: pl.DataFrame, maps: dict[str, dict[str, pl.DataFrame
 
 def prepare_records(rec: pl.DataFrame) -> pl.DataFrame:
     """Normalised records -> the columns used here, nulls filled, plus `nolegal` (full_name without legal words at
-    any position; falls back to core_name), `legal_any` (sorted canonical legal words found anywhere) and
-    `postcode` (find_postcode on the raw address). The raw address is dropped afterwards."""
+    any position; falls back to core_name) and `legal_any` (sorted canonical legal words found anywhere)."""
     rec = rec.select(REC_COLS).with_columns(
-        *[pl.col(c).fill_null("") for c in ("country", "business_address", "full_name", "core_name", "legal", "addr_norm")],
+        *[pl.col(c).fill_null("") for c in ("country", "full_name", "core_name", "legal", "addr_norm")],
         pl.col("numbers").fill_null([]),
     )
-    rec = rec.with_columns(_postcodes(rec["business_address"], rec["city"])).drop("business_address")
     key = pl.col("country").str.to_lowercase().str.strip_chars()
     parts = []
     for k, g in rec.with_columns(key.alias("_k")).group_by("_k", maintain_order=True):
@@ -304,11 +255,7 @@ def _address_features(q: dict, p: dict) -> list[pl.Series]:
            _f32("f_addr_tok_jacc", _jaccard(a, b, 0)),
            _f32("f_addr_c3_jacc", _jaccard(a, b, 3)),
            _f32("f_city_same", _eq(qc, pc)), _f32("f_city_ratio", city_fz), _f32("f_city_in_addr", city_in),
-           _f32("f_state_agree", _eq(q["state"], p["state"])),
-           _f32("f_dept_agree", _eq(q["dept"], p["dept"])),
-           _f32("f_s1_has_postcode", [bool(x) for x in q["postcode"]]),
-           _f32("f_cand_has_postcode", [bool(x) for x in p["postcode"]]),
-           _f32("f_postcode_agree", _eq(q["postcode"], p["postcode"]))]
+           _f32("f_state_agree", _eq(q["state"], p["state"]))]
     n = len(a)
     cols = {k: np.full(n, np.nan, np.float32) for k in
             ("n_s1", "n_cand", "shared", "only_s1", "only_cand", "jacc", "first_eq", "last_eq")}
@@ -347,8 +294,7 @@ def _blocking_features(x: pl.DataFrame) -> list[pl.Expr]:
 def row_features(pairs: pl.DataFrame, s1_rec: pl.DataFrame, pool_rec: pl.DataFrame, stats: SideStats) -> pl.DataFrame:
     """Per-pair features that need only the pair itself (safe to compute in row chunks). Keeps pairs' order and
     carries q_core / p_core for the context step."""
-    cols = ("country", "full_name", "core_name", "nolegal", "legal", "legal_any", "addr_norm", "city", "state", "dept",
-            "postcode", "numbers")
+    cols = ("country", "full_name", "core_name", "nolegal", "legal", "legal_any", "addr_norm", "city", "state", "numbers")
     x = (pairs.select("s1", "cand").with_row_index("_i")
          .join(s1_rec.select(pl.col("entity_id").alias("s1"), *[pl.col(c).alias(f"q_{c}") for c in cols]), on="s1", how="left")
          .join(pool_rec.select(pl.col("entity_id").alias("cand"), *[pl.col(c).alias(f"p_{c}") for c in cols]), on="cand", how="left")

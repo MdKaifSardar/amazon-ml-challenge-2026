@@ -230,3 +230,38 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     name+address score 0.82, address token set 0.82.
   - Still no val F0.5: that needs stream B's model. Outputs published as the Kaggle dataset
     `amazon-ml-2026-features-v1` (created from the notebook output; features_train/val.parquet, report, config).
+- **2026-09-26, feat-v2 code + sample run, Kaggle CPU `ananyaghosh09/features-v2-sample`** (`src/run_features.py
+  --splits train val test --prune val --sample-s1 3000`; 147 s in total, peak 7.5 GB). No model, so no val F0.5.
+  - Changes from feat-v1, agreed with the team:
+    - `f_state_agree` (1 same / 0 different / NaN missing). Missing states are filled from the city, then the
+      département, with blocking's `state_maps` / `fill_states`, learned per country on all train + test records.
+    - `f_cand_is_s3` (source flag; README table 6 updated).
+    - `f_rare_shared`, `f_rare_only_s1`, `f_rare_only_cand`, `f_rare_shared_idf` (blocking's rare-token definition:
+      document frequency <= 20 in the country, 3+ characters) replace `f_score_rare` / `f_rank_rare` (98% NaN).
+    - All counts (`f_freq_*`, token df for the idf features, rare words) now come from ALL train + test records
+      of the country, the same for every split. No feature counts how many S1 lists a candidate is in (unit test).
+    - Test split: built one country at a time (parts joined with sink_parquet); no-label checks (schema, dtype,
+      duplicates, inf; the job fails otherwise) and NaN share / median per split x country with test-vs-train
+      shift flags (France compared with all train).
+  - Sample (3,000 S1 per split): 90 features at that point, identical float32 schema in every split x country, 0
+    duplicate pairs, 0 inf. Lists 6.5 per S1 (train, val) and 7.3 (test).
+  - How often the new features fire:
+
+    | feature | train | test |
+    |---|---|---|
+    | postcode found, S1 / candidate | 0.08% / 0.09% | 0.20% / 0.15% |
+    | `f_postcode_agree` present | ~0.02% | ~0.07% |
+    | `f_dept_agree` present | 0 | **0 (France included)** |
+    | `f_state_agree` = different (NaN share) | 0.06% (24-25%) | 0.05% (10-18%) |
+    | `f_rare_shared` > 0 | 1.7% | 3.4% |
+
+    - Postcodes (taken by position, not any 5-6 digit token): the data mostly has none. EDA found 5-6 digit numbers
+      in 0% of Indian and 0.3% of French addresses; the US 11% are almost all house numbers at the start ("12345
+      Main St"), which the rule rightly rejects. So feat-v1's long-number features (4%) mostly caught house numbers.
+    - Département: French S1 never has one detected (only S2/S3, ~31%), so `f_dept_agree` never fires.
+  - Shift flags, 38 of 270 feature x country rows. None looks like a bug: France has fewer empty addresses (address
+    NaN ~10% vs 25% in train), fewer blocking methods per candidate (median 2 vs 4), and several 0/1 features flip
+    their median (train lists are ~51% positives; test lists are longer).
+  - **Decision (team): drop `f_dept_agree` and all postcode features** (`f_postcode_agree`, `f_s1_has_postcode`,
+    `f_cand_has_postcode`; `find_postcode` removed). The département still counts through the state filling.
+    **feat-v2 = 86 features.** Unit tests 93 passed.

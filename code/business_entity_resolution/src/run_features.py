@@ -36,10 +36,11 @@ from features import (FEATURE_VERSION, build, count_stats, country_state_maps, f
 
 SEED = 42
 T0 = time.time()
-NORM_COLS = ["entity_id", "country", "business_address", "full_name", "core_name", "legal", "addr_norm", "city", "state",
-             "dept", "numbers"]
-DEPT_NOTE = ("f_dept_agree (French departement) is all-NaN in train and val (no France there), so a model trained on "
-             "them cannot use it; it only fires on French test pairs. f_state_agree is the useful location-agreement feature.")
+NORM_COLS = ["entity_id", "country", "full_name", "core_name", "legal", "addr_norm", "city", "state", "dept", "numbers"]
+# dept is read only to fill missing states (fill_states); it is not a feature.
+DROP_NOTE = ("No departement or postcode feature (dropped after features-v2-sample): French S1 never has a departement "
+             "detected, and 5-6 digit postcodes appear in ~0.1% of addresses (most such numbers are US house numbers). "
+             "The departement still counts through the state filling behind f_state_agree.")
 SHIFT_NAN, SHIFT_MED = 0.10, 0.25  # flag: NaN share moves >= 0.10, or the median moves >= 0.25 x the reference p10-p90 range
 P_NOTE = ("f_p_u50, f_p_gap and f_list_rank come from the blocking pruner, which was trained on 100k train-split S1: "
           "for those S1 they are in-sample (too confident). Train the model on other train S1 or drop these columns for them.")
@@ -171,7 +172,7 @@ def main() -> None:
               f"Pruned to the submitted set here: {a.prune or 'none'}.", "",
               "Counts (f_freq_*, token df for the idf features, f_rare_*) and the state maps are computed over ALL "
               "train + test records of each country, identical for every split. No feature counts how many S1 lists "
-              "a candidate appears in.", "", f"**Note for stream B:** {P_NOTE}", "", f"**Note:** {DEPT_NOTE}", ""]
+              "a candidate appears in.", "", f"**Note for stream B:** {P_NOTE}", "", f"**Note:** {DROP_NOTE}", ""]
     body, sizes, timing, check_rows, profiles, ref_schema, names = [], [], {}, [], [], None, None
     for split in a.splits:
         path = find(a.input, f"{split}_candidates.parquet")
@@ -257,7 +258,7 @@ def main() -> None:
     (a.out_dir / "features_config.json").write_text(json.dumps(
         {"feature_version": FEATURE_VERSION, "sample_s1": a.sample_s1, "splits": a.splits, "pruned": a.prune,
          "list_sizes": sizes, "checks": check_rows, "checks_ok": ok, "timing": timing, "features": names,
-         "notes": [P_NOTE, DEPT_NOTE]}, indent=1, default=str))
+         "notes": [P_NOTE, DROP_NOTE]}, indent=1, default=str))
     log(f"checks ok: {ok}")
     if not ok:
         raise SystemExit("feature checks failed, see features_report.md")
