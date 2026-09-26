@@ -6,3 +6,4 @@ anyascii==0.3.3
 scipy==1.18.1
 scikit-learn==1.9.1
 sparse-dot-topn==1.2.0
+lightgbm==4.7.0
