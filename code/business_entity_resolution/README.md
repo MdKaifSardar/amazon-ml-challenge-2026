@@ -48,6 +48,11 @@ Run all commands below from this folder (`code/business_entity_resolution/`), wi
    `python src/run_features.py --input <dir with *_candidates.parquet and normalised/> --out-dir <out> --splits train val test --prune val`
    (`--prune val`: the blocking-eval-v3 val table is the unpruned starting list; train and test are already pruned).
 
+7. Model + selection + test outputs (Kaggle CPU job `model-v1`, ~50 min): LightGBM variants, F0.5-tuned selection,
+   France checks, both output files and the validator:
+   `python src/run_model.py --input <folder with features-v2, blocking-v3 candidates, split, raw data> --out-dir DIR --validator ../../utils/validate_submission.py`
+   Current submission: variant C, tau 0.65, margin 0.7, validation macro F0.5 0.9717.
+
 ## Shared table formats (interfaces between the streams)
 All tables are Parquet with string ids. `s1` = Source 1 entity_id and `cand` = S2/S3 entity_id. The pair key
 everywhere is `(s1, cand)`.
@@ -60,8 +65,8 @@ everywhere is `(s1, cand)`.
 | 4 | candidate table, wide `val_candidates.parquet` (validation S1) | `blocking-eval-v3`; any split via `to_wide()` in `run_blocking_eval.py` | scope, s1, cand, rank_{name,name_city,name_addr,reverse,rare} (null = not found by that method), score_* (same), best_reverse, best_{name,name_city,name_addr} (the S1's top score per method), order (best cosine), is_match (validation only), role, p_u20, p_u50 (pruner probability) |
 | 5 | submitted candidate set (default operating point) | `candidates.prune()` | rows of table 4 in the starting list `u50` with p_u50 >= 0.01, at most 10 per S1 by p_u50 (`config.json` -> operating_points, target 7) |
 | 6 | pair features (stream A -> B) | `features.py` + `run_features.py` (feat-v2, 86 features) | s1, cand, f_* (float32; one column per feature, NaN = missing). One file per split: train, val, test (rows grouped by S1 country). No label, country or language column. One source feature: `f_cand_is_s3` (1 = S3 candidate, 0 = S2). All counts (name / token frequency, rare words) and the state maps come from ALL train + test records of the country, the same for every split; no feature counts how many S1 lists a candidate is in. No département or postcode feature (they almost never fire). Missing states for `f_state_agree` are filled from the city (blocking's maps; no département → state map is learned on the real data) |
-| 7 | pair scores (B -> selection -> C) | `model.py` (to build) | s1, cand, score (match probability, 0–1) |
-| 8 | selection config (B -> C) | `select.py` (to build) | JSON: model file, threshold, margin, one_to_one (bool), plus the validation F0.5 it was tuned for |
+| 7 | pair scores (B -> selection -> C) | `model.py` + `run_model.py` | s1, cand, score (match probability, 0–1) |
+| 8 | selection config (B -> C) | `selection.py` + `run_model.py` (`selection_config.json`) | JSON: model file, threshold, margin, one_to_one (bool), plus the validation F0.5 it was tuned for |
 | 9 | output files | `submission.py` | `matching_results.tsv`, `candidate_pairs.tsv` (spec in the problem statement; candidates = table 5 for test S1) |
 
 Rules for every stream:
@@ -84,6 +89,10 @@ cross-fitted pruner scores.
   >= 20 records / >= 90% rule on this data), GPU/CPU top-k.
 - `src/candidates.py`: selection rules, the cheap pruner (features, training, chunked scoring), list statistics.
   Tests in `tests/test_candidates.py`.
+- `src/model.py`: LightGBM training / prediction and the feature sets A / B / C.
+- `src/selection.py`: threshold, one owner per S2/S3, margin; vectorised macro F0.5 (tests in `tests/test_selection.py`).
+- `src/run_model.py`: model + selection end to end (training, validation, stress test, test outputs, validator).
+- `src/write_candidates.py`: `candidate_pairs.tsv` from the blocking output, with checks and the validator.
 - `src/run_blocking_eval.py`, `src/run_blocking_test_check.py`: blocking evaluation and the test-data France check.
 - `src/features.py`: pair features (table 6): names, rare words, legal form, address (city / state
   agreement, numbers), blocking scores, per-list context, source flag. Tests in

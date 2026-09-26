@@ -6,6 +6,7 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
 | Date/time | Change | Blocking recall | Val F0.5 overall | Val F0.5 US / India | Singleton / non-singleton | Kept? |
 |---|---|---|---|---|---|---|
 | 2026-09-25 13:05 | All-empty baseline (`src/baseline_empty.py`) | n/a (no candidates) | 0.0559 | 0.0562 / 0.0554 | 1.0 / 0.0 | Reference |
+| 2026-09-27 01:10 | LightGBM variant C on feat-v2 + selection (tau 0.65, margin 0.7), Kaggle `model-v1` | 0.9685 (candidate set, 6.56 per S1) | **0.9717** (report half) | 0.9804 / 0.9586 | 0.9677 / 0.9720 | **Kept** (first submission) |
 
 ## Run log
 
@@ -322,3 +323,58 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     unaffected.
   - Published as the Kaggle dataset `ananyaghosh09/amazon-ml-2026-features-v2` (from the notebook output; all 9
     files: features_{train,val,test}.parquet, report, config, profile, shift and the two AUC CSVs).
+
+- **2026-09-27, model v1: LightGBM + selection** (`src/model.py`, `src/selection.py`, `src/run_model.py`; Kaggle CPU
+  `model-v1`, 51 min, peak 8.6 GB). Inputs: features-v2, blocking-v3 candidates, the split.
+  - Training: the ~200k train S1 the blocking pruner never saw (1.18M fit pairs + 130k early-stop pairs, held out by
+    S1); A_all adds the pruner's 100k S1.
+  - Validation: all 99,994 S1 (including 19 without candidates). The selection is tuned on the tune half
+    (49,962 S1) and reported on the report half (50,032 S1). The vectorised F0.5 equals `metric.py` exactly
+    (0.971861).
+
+    | variant | features | tau / margin / one owner | tune F0.5 | **report F0.5** | India | US | singleton / non-singleton | precision / recall | predicted per S1 |
+    |---|---|---|---|---|---|---|---|---|---|
+    | A (all) | 86 | 0.75 / 0 / yes | 0.9716 | 0.9719 | 0.9585 | 0.9807 | 0.9795 / 0.9714 | 0.994 / 0.935 | 3.26 |
+    | B (no f_n_methods) | 85 | 0.65 / 0.7 / yes | 0.9713 | 0.9718 | 0.9583 | 0.9808 | 0.9691 / 0.9720 | 0.993 / 0.938 | 3.27 |
+    | **C** (B, no pruner-derived) | 82 | 0.65 / 0.7 / no | 0.9716 | **0.9717** | 0.9586 | 0.9804 | 0.9677 / 0.9720 | 0.992 / 0.938 | 3.27 |
+    | A_all (pruner S1 incl.) | 86 | 0.75 / 0 / yes | 0.9720 | 0.9724 | 0.9597 | 0.9808 | 0.9802 / 0.9719 | 0.994 / 0.936 | 3.26 |
+
+  - **Choice C** (rule: the most France-robust variant within 0.5 F0.5 points of the best). It costs 0.07 points vs
+    the best (A_all).
+  - Overfitting checks:
+    - tune vs report F0.5 differ by < 0.001;
+    - A vs A_all +0.0005, so the pruner overlap is harmless;
+    - early-stop logloss 0.049–0.050.
+  - Where F0.5 is lost: recall, not precision (precision 0.99, recall 0.94). The blocking ceiling is 96.85%; India
+    0.959 vs US 0.980.
+  - Feature importance (gain):
+    - A / B: `f_p_u50` ~0.50, then `f_p_gap`, the house-number features and name token Jaccard.
+    - C: house-number Jaccard 0.37, `f_num_only_s1` 0.10, address token-set 0.08, reverse rank / gap.
+  - France-like stress test (validation true pairs by the number of search methods that found them):
+    - 1 method (7,219 pairs): selected 84.8% (A) vs 86.1% (B / C);
+    - 2 methods: 95.3% vs 95.7%;
+    - 3+: 97.1% vs 97.4%.
+    - No variant under-scores 1–2-method pairs much: the model loss for them is small and B / C are slightly
+      better.
+    - The real loss is in blocking: the pruner keeps 88.7% of 1-method true pairs, vs 98.7% (2) and 99.7% (3+).
+    - Negatives by method count are selected at 0.3–0.8% in every variant.
+  - Test (variant C): 5,667,965 matches for 1,732,544 S1.
+
+    | | France | India | US |
+    |---|---|---|---|
+    | predicted matches per S1 | **3.36** | 3.18 | 3.34 |
+    | S1 with no match | 5.0% | 6.6% | 5.7% |
+    | capped lists: matches at positions 9–10 | 1.7% (5,749) | 1.3% | 1.3% |
+    | capped lists: matches at positions 1–3 | 64% | 65% | 62% |
+    | search methods of matched pairs (mean) | 3.3 | 3.3 | 3.8 |
+
+    - France is not under-predicted: 3.36 matches per S1, like the US; the singleton-like share of 5% is close to
+      train's 5.6%.
+    - French matches sit near the top of capped lists (mean position 3.1). The share at positions 9–10 is only a
+      little higher than US / India (1.7% vs 1.3%), so the cap of 10 may cut a small number of French matches
+      (well under 1% of French matches).
+    - A by-eye check of 6 random French S1: all matches correct (abbreviations R. / Rue, Sàrl, reordered
+      addresses, Gironde département instead of the région).
+  - Output files: organiser validator 0 errors / 0 warnings on Kaggle (`--check-ids`) and PASS locally
+    (`dataset/test`). `matching_results.tsv`: 1,628,422 non-empty rows, 104,122 empty; `candidate_pairs.tsv`: the
+    blocking v3 set, 280 empty. Local copies are in `output/`.
