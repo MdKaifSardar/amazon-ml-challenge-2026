@@ -265,3 +265,26 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
   - **Decision (team): drop `f_dept_agree` and all postcode features** (`f_postcode_agree`, `f_s1_has_postcode`,
     `f_cand_has_postcode`; `find_postcode` removed). The département still counts through the state filling.
     **feat-v2 = 86 features.** Unit tests 93 passed.
+- **2026-09-26, feat-v2 full run, Kaggle CPU `ananyaghosh09/features-v2`** (`src/run_features.py --splits train val
+  test --prune val`; 1,703 s = 28 min in total, peak 13.8 GB during test India). No model, so no val F0.5.
+  Outputs: `features_{train,val,test}.parquet` (`s1, cand` + 86 `f_*` float32), report, profile, shift and AUC CSVs.
+  - Rows: train 1,967,275 (299,670 S1), val 656,181 (99,975 S1; pruned from 11,776,475, positives 334,945 = 96.85%),
+    **test 12,666,305 (1,732,264 S1: France 1,953,139 / India 6,205,439 / US 4,507,727 pairs)**. The 280 test S1
+    without candidates have no rows (the output files keep them as empty lists). Lists: 6.56 per S1 (train, val),
+    7.31 (test); median 6 / 7, p95 10, max 10.
+  - Speed ~9.4-10.1k pairs/s per country (test 22 min); counts + state maps over all 24M records took 22 s.
+  - Checks, every split x country: same 86 columns, order and float32 dtype as train; 0 duplicate pairs; 0 inf;
+    no all-NaN feature.
+  - Train vs val AUC per feature agrees within 0.0025. Strongest are unchanged: p_u50 0.959, number jaccard 0.916,
+    number only-S1 / only-cand 0.12 / 0.13 (inverse), first number equal 0.85.
+  - New features, AUC alone (train): `f_rare_only_cand` 0.553, `f_rare_shared` 0.508, `f_rare_only_s1` 0.498,
+    `f_state_agree` 0.501 (NaN 24%), `f_cand_is_s3` 0.500. Weak on their own, as expected (blocking already
+    searches within a state and by rare tokens); whether they help in combination is for stream B's model.
+  - Test vs train shift flags: 36 of 258 feature x country rows (France 27, India 5, US 4).
+    - France vs all train: fewer empty addresses (address / city / number features NaN 8.5-13.5% vs 24-30%), and
+      the forward name / name+city searches found fewer French candidates (`f_score_name` NaN 42.5% vs 24.6%,
+      `f_score_name_city` 47.1% vs 26.1%; median `f_n_methods` 2 vs 4). So French candidates come more from the
+      name+address / reverse searches. This is a blocking fact, not a feature bug; the model sees NaN there.
+    - India / US: only 0/1 or count features whose median flips (number first-equal, only-S1 / only-cand, last
+      name token), consistent with test lists being longer (7.3 vs 6.6) and so holding a smaller share of matches.
+  - Next: publish as the Kaggle dataset `amazon-ml-2026-features-v2` (New Dataset from the notebook output).
