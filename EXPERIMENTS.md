@@ -181,3 +181,19 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - Watch item: slightly more French candidates pass tau (8.6% vs 6.4–6.7%). With cap 10, lists hit the cap
       as often as India's. If French S1 have more true matches than the cap allows, the cap could cut some. It
       cannot be measured without labels; check by eye in the prediction sanity check.
+
+- **2026-09-26, Job A: Train candidate generation on 300k S1 sample** (`code/business_entity_resolution/src/run_blocking_job_a.py`).
+  Executed on AWS EC2 `c6i.2xlarge` (8 dedicated vCPUs, 15 GiB RAM + 16 GiB swap), runtime 3,365 s (56 min).
+  Output: `artifacts/blocking_eval/train_candidates.parquet` (1,967,275 rows, 74 MB) and published to Kaggle dataset
+  `amazon-ml-2026-blocking-v3`.
+  - Input: 299,728 training S1 query entities (Folds 1–4 from `g25_split.parquet`) against full train pool (4.1M India, 6.2M US).
+  - Frozen setup: starting list u50 (fwd 50, rev 5, rare 20), pruner model `pruner_state_u50.pkl` with tau = 0.01, cap = 10.
+  - Candidate set size: 1,967,275 pairs across 299,670 unique S1 (99.98% coverage; empty lists 0.02%).
+    - India: avg 6.97, median 7.0, p95 10.0 per S1.
+    - US: avg 6.29, median 6.0, p95 10.0 per S1.
+    - Overall: avg 6.56, median 6.0, p95 10.0 per S1 (target ~6.6).
+  - Ground truth recall:
+    - Overall: **96.86%** (1,004,706 / 1,037,267 true pairs recalled; matches 96.8% benchmark).
+    - India: **93.97%** (390,639 / 415,712; matches 94.0% benchmark).
+    - US: **98.80%** (614,067 / 621,555; matches 98.8% benchmark).
+  - Pruner separation: True match median p_u50 = 0.9744 vs negative decoy median p_u50 = 0.0731.
