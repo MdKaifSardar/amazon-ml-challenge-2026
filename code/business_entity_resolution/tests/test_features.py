@@ -8,9 +8,9 @@ import polars as pl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from features import build, feature_names, legal_words, pool_stats, prepare_records  # noqa: E402
+from features import build, count_stats, feature_names, legal_words, prepare_records  # noqa: E402
 
-REC_SCHEMA = {"entity_id": pl.Utf8, "country": pl.Utf8, "full_name": pl.Utf8, "core_name": pl.Utf8, "legal": pl.Utf8,
+REC_SCHEMA = {"entity_id": pl.Utf8, "country": pl.Utf8, "business_address": pl.Utf8, "full_name": pl.Utf8, "core_name": pl.Utf8, "legal": pl.Utf8,
               "addr_norm": pl.Utf8, "city": pl.Utf8, "state": pl.Utf8, "dept": pl.Utf8, "numbers": pl.List(pl.Utf8)}
 
 
@@ -19,18 +19,19 @@ def recs(rows):
 
 
 S1 = recs([
-    ("S1-1", "US", "willow llc", "willow", "llc", "24 greenwood lane, austin, tx 78701", "austin", "tx", None, ["24", "78701"]),
-    ("S1-2", "India", "royal food pvt ltd", "royal food", "pvt ltd", "12 mg road, bengaluru, karnataka 560001",
+    ("S1-1", "US", "24 Greenwood Ln, Austin, TX 78701", "willow llc", "willow", "llc", "24 greenwood lane, austin, tx 78701", "austin", "tx", None, ["24", "78701"]),
+    ("S1-2", "India", "12 MG Road, Bengaluru, Karnataka 560001", "royal food pvt ltd", "royal food", "pvt ltd", "12 mg road, bengaluru, karnataka 560001",
      "bengaluru", "karnataka", None, ["12", "560001"]),
-    ("S1-3", "France", "boulangerie martin sarl", "boulangerie martin", "sarl", "12 rue saint honore, 75001 paris",
+    ("S1-3", "France", "12 Rue Saint-Honore, 75001 Paris", "boulangerie martin sarl", "boulangerie martin", "sarl", "12 rue saint honore, 75001 paris",
      "paris", "ile de france", None, ["12", "75001"]),
 ])
 POOL = recs([
-    ("S2-a", "US", "willow llc center", "willow llc center", "", "24 greenwood lane, austin, tx 78701", "austin", "tx", None, ["24", "78701"]),
-    ("S3-b", "US", "willow inc", "willow", "inc", "25 greenwood lane, austin, tx 78701", "austin", "tx", None, ["25", "78701"]),
-    ("S2-c", "India", "royal food private limited", "royal food", "pvt ltd", "", None, None, None, []),
-    ("S3-d", "France", "boulangerie martin sarl", "boulangerie martin", "sarl", "12 r saint honore, paris", None, None, None, ["12"]),
+    ("S2-a", "US", "24 Greenwood Lane, Austin TX 78701", "willow llc center", "willow llc center", "", "24 greenwood lane, austin, tx 78701", "austin", "tx", None, ["24", "78701"]),
+    ("S3-b", "US", "25 Greenwood Lane, Austin, TX 78701", "willow inc", "willow", "inc", "25 greenwood lane, austin, tx 78701", "austin", "tx", None, ["25", "78701"]),
+    ("S2-c", "India", "", "royal food private limited", "royal food", "pvt ltd", "", None, None, None, []),
+    ("S3-d", "France", "12 r Saint Honore, Paris", "boulangerie martin sarl", "boulangerie martin", "sarl", "12 r saint honore, paris", None, None, None, ["12"]),
 ])
+STATS = count_stats([S1], [POOL])
 PAIRS = pl.DataFrame({
     "s1": ["S1-1", "S1-1", "S1-2", "S1-3"], "cand": ["S2-a", "S3-b", "S2-c", "S3-d"],
     "score_name": [0.9, 0.95, 0.8, None], "rank_name": [2, 1, 1, None],
@@ -41,7 +42,7 @@ PAIRS = pl.DataFrame({
 
 @pytest.fixture(scope="module")
 def feats():
-    stats = pool_stats(S1["core_name"], POOL["core_name"])
+    stats = STATS
     return build(PAIRS, S1, POOL, stats, chunk=3)  # chunk smaller than the table: S1-1's list spans two chunks
 
 
@@ -54,7 +55,7 @@ def test_schema_order_and_dtype(feats):
     assert feats.select("s1", "cand").equals(PAIRS.select("s1", "cand"))
     names = feature_names(feats)
     assert names and all(feats.schema[c] == pl.Float32 for c in names)
-    assert not any(w in c for c in feats.columns for w in ("country", "source", "is_match", "lang", "state", "dept"))
+    assert not any(w in c for c in feats.columns for w in ("country", "is_match", "lang"))
 
 
 def test_nolegal_handles_mid_name_legal_word(feats):
@@ -74,7 +75,7 @@ def test_legal_agreement(feats):
 def test_house_number_decoy(feats):
     a, b = row(feats, "S2-a"), row(feats, "S3-b")
     assert a["f_num_first_eq"] == 1 and b["f_num_first_eq"] == 0
-    assert a["f_num_long_shared"] == 1 and a["f_num_long_conflict"] == 0
+    assert a["f_postcode_agree"] == 1 and a["f_s1_has_postcode"] == 1 and a["f_cand_has_postcode"] == 1
     assert a["f_city_same"] == 1
     assert a["f_ctx_num_jacc"] > 0 and b["f_ctx_num_jacc"] < 0  # better / worse than the other candidate
 
@@ -93,7 +94,7 @@ def test_france_works_without_labels_or_country_rules(feats):
     r = row(feats, "S3-d")
     assert r["f_name_full_ratio"] == pytest.approx(1.0) and r["f_legal_same"] == 1
     assert math.isnan(r["f_city_same"]) and r["f_city_in_addr"] == 1  # "paris" appears in the candidate's address
-    assert r["f_num_first_eq"] == 1 and math.isnan(r["f_num_long_shared"])  # candidate has no postcode
+    assert r["f_num_first_eq"] == 1 and math.isnan(r["f_postcode_agree"]) and r["f_cand_has_postcode"] == 0  # candidate has no postcode
 
 
 def test_blocking_features(feats):
@@ -103,12 +104,12 @@ def test_blocking_features(feats):
     assert a["f_n_methods"] == 2 and b["f_n_methods"] == 1
     assert a["f_list_rank"] == 1 and b["f_list_rank"] == 2 and a["f_list_size"] == 2
     assert b["f_p_gap"] == pytest.approx(0.6)
-    assert math.isnan(a["f_score_rare"])  # absent column -> NaN, same schema for every split
+    assert math.isnan(a["f_score_name_city"])  # absent column -> NaN, same schema for every split
+    assert "f_score_rare" not in feats.columns and a["f_cand_is_s3"] == 0 and b["f_cand_is_s3"] == 1
 
 
 def test_same_result_regardless_of_chunk(feats):
-    stats = pool_stats(S1["core_name"], POOL["core_name"])
-    one = build(PAIRS, S1, POOL, stats, chunk=10)
+    one = build(PAIRS, S1, POOL, STATS, chunk=10)
     assert np.allclose(one.drop("s1", "cand").to_numpy(), feats.drop("s1", "cand").to_numpy(), equal_nan=True)
 
 
@@ -118,9 +119,8 @@ def test_legal_words_open_set():
 
 
 def test_missing_record_raises():
-    stats = pool_stats(S1["core_name"], POOL["core_name"])
     with pytest.raises(ValueError):
-        build(PAIRS.with_columns(pl.lit("S2-zz").alias("cand")).head(1), S1, POOL, stats)
+        build(PAIRS.with_columns(pl.lit("S2-zz").alias("cand")).head(1), S1, POOL, STATS)
 
 
 def test_prune_standard_matches_default_operating_point():

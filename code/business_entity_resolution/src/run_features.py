@@ -25,11 +25,13 @@ import polars as pl
 from sklearn.metrics import roc_auc_score
 
 from candidates import prune, rule
-from features import FEATURE_VERSION, build, feature_names, pool_stats, prepare_records
+from features import (FEATURE_VERSION, build, count_stats, country_state_maps, feature_names, fill_record_states,
+                      prepare_records)
 
 SEED = 42
 T0 = time.time()
-NORM_COLS = ["entity_id", "country", "full_name", "core_name", "legal", "addr_norm", "city", "numbers"]
+NORM_COLS = ["entity_id", "country", "business_address", "full_name", "core_name", "legal", "addr_norm", "city", "state",
+             "dept", "numbers"]
 P_NOTE = ("f_p_u50, f_p_gap and f_list_rank come from the blocking pruner, which was trained on 100k train-split S1: "
           "for those S1 they are in-sample (too confident). Train the model on other train S1 or drop these columns for them.")
 
@@ -120,12 +122,15 @@ def main() -> None:
     ids_s1 = pl.concat([c.select(pl.col("s1").alias("entity_id")) for c in cands.values()]).unique()
     ids_pool = pl.concat([c.select(pl.col("cand").alias("entity_id")) for c in cands.values()]).unique()
     src = {k: find(a.input, f"train_source{k}.parquet", parent="normalised") for k in (1, 2, 3)}
-    log(f"normalised files: {src}")
-    stats = pool_stats(pl.read_parquet(src[1], columns=["core_name"])["core_name"],
-                       pl.concat([pl.read_parquet(src[k], columns=["core_name"]) for k in (2, 3)])["core_name"])
-    log(f"side stats: pool {stats.n_pool:,} records, {len(stats.token_df):,} tokens")
-    rec = lambda paths, ids: prepare_records(pl.concat([pl.scan_parquet(p).select(NORM_COLS).join(ids.lazy(), on="entity_id", how="semi")
-                                                        for p in paths]).collect())
+    every = {(side, k): find(a.input, f"{side}_source{k}.parquet", parent="normalised") for side in ("train", "test") for k in (1, 2, 3)}
+    log(f"normalised files: {every}")
+    # Counts and state maps over ALL train + test records of each country (no labels): same meaning for every split.
+    stats = count_stats([pl.scan_parquet(p) for (_, k), p in every.items() if k == 1],
+                        [pl.scan_parquet(p) for (_, k), p in every.items() if k != 1])
+    log(f"side stats: {stats.n} records, {stats.token_df.height:,} (country, token) rows")
+    maps = country_state_maps(pl.concat([pl.read_parquet(p, columns=["country", "city", "dept", "state"]) for p in every.values()]))
+    rec = lambda paths, ids: prepare_records(fill_record_states(
+        pl.concat([pl.scan_parquet(p).select(NORM_COLS).join(ids.lazy(), on="entity_id", how="semi") for p in paths]).collect(), maps))
     s1_rec, pool_rec = rec([src[1]], ids_s1), rec([src[2], src[3]], ids_pool)
     log(f"records: s1 {s1_rec.height:,}, pool {pool_rec.height:,}")
 
