@@ -211,3 +211,15 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - Overall: avg 7.31 candidates per S1 (within 6.5–7.5 target range).
   - Submissions: `output/candidate_pairs.tsv` downloaded locally and verified against competition schema.
 
+- **2026-09-26, official candidate file from Job B** (`src/write_candidates.py`, Kaggle CPU job `candidates-tsv`,
+  72 s). Correction to the Job B entry: its `output/candidate_pairs.tsv` was in pair format (header
+  `source_1_id, candidate_id`, one row per pair, the 280 S1 without candidates missing), which the organiser
+  validator rejects. It has been rebuilt from `test_candidates.parquet`.
+  - Format: one row per test S1 (1,732,544, in test_source1 order), comma-joined ids ordered by pruner score, and
+    280 empty lists.
+  - 12,666,305 pairs; 7.31 per S1; max 10; no duplicate pairs; every S1 is a test S1; every candidate is S2/S3.
+  - `matching_results.tsv` is written all-empty for now (the model stage replaces it).
+  - Organiser validator with `--check-ids` (id-only copies of the test files): **0 errors, 0 warnings**.
+  - `test_candidates.parquet` has exactly the same columns and types as `train_candidates.parquet` (apart from
+    the train label `is_match`), so the features code runs on test unchanged.
+  - The files are in the `candidates-tsv` notebook output, `output/`.
