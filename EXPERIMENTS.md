@@ -181,3 +181,14 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - Watch item: slightly more French candidates pass tau (8.6% vs 6.4–6.7%). With cap 10, lists hit the cap
       as often as India's. If French S1 have more true matches than the cap allows, the cap could cut some. It
       cannot be measured without labels; check by eye in the prediction sanity check.
+
+- **2026-09-26, pair features feat-v1: code only (stream A, branch `features`; no val F0.5 yet).**
+  - `src/features.py` builds table 6: `s1, cand` + 86 `f_*` float32 columns, NaN = missing, input row order kept.
+    Groups: name 27 (full / core / legal-words-removed-anywhere names), legal form 7, address 22 (city / state /
+    département, numbers), blocking 19, context 11 (name frequency, gap to the best other candidate of the S1).
+    No country, source, language or label column. Unit tests: `tests/test_features.py`, 10/10 pass.
+  - Left out on purpose: candidate popularity (S1 count per candidate). The train / val / test candidate tables
+    cover 300k / 100k / 1.7M S1, so the value would shift between splits.
+  - **Warning for stream B:** `f_p_u50` (the pruner score) and the features derived from it (`f_p_gap`, `f_list_rank`)
+    are **in-sample** for the pruner's own 100k training S1 (train split). Train the model on the other train S1,
+    or drop these columns for those S1.
