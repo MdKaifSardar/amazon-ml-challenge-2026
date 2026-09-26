@@ -16,7 +16,8 @@ Search scope (a compute split, not a filter):
 - "state": a forward query searches the pool records of its own state plus all pool records without a
   state; an S1 without a state searches the whole country. The reverse search runs within states; a pool
   record without a state searches all S1 of the country (fallback). Before bucketing, a missing state is
-  inferred from the city, then the dept (state_maps / fill_states, learned from records that have both).
+  inferred from the city, then the dept (state_maps / fill_states, learned from records that have both). On the
+  challenge data no dept -> state map passes the rule, so in practice only the city fills states.
 - "country": every search covers the whole country (affordable on a GPU); recovers pairs whose states
   disagree.
 The rare-token index ignores states in both scopes.

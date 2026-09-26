@@ -129,7 +129,8 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     evaluate 25 min, peak 22.8 GB, all CPU). Changes:
     - A missing state is inferred from the city, then the département. The maps are learned from records that have
       both (>= 20 records, >= 90% agreement; train + test, no labels) and are used for bucket placement and pruner
-      features.
+      features. Correction (2026-09-27): no département -> state map passes the rule on this data (0 in every
+      country; found in feat-v2), so missing states come from the city only.
     - Pool records still without a state run the reverse search against all S1 of the country.
     - Pruner also on a larger starting list u50 = fwd top-50 + reverse top-5 + rare top-20. Training rows are capped
       at 6M (all positives kept).

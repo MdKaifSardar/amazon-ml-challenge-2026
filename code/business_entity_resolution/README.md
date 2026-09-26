@@ -80,7 +80,8 @@ cross-fitted pruner scores.
   `Normaliser.addresses()`), `learn_state_aliases()` (train pairs only) and `Normaliser.load()` for the saved
   aliases. Version string `NORM_VERSION`. Tests in `tests/test_normalise.py`.
 - `src/blocking.py`: TF-IDF searches (forward name / name + city / name + address, reverse S2/S3 -> S1, rare
-  tokens), state buckets with city / département inference, GPU/CPU top-k.
+  tokens), state buckets with missing states inferred from the city (a département map is also tried, but none passes the
+  >= 20 records / >= 90% rule on this data), GPU/CPU top-k.
 - `src/candidates.py`: selection rules, the cheap pruner (features, training, chunked scoring), list statistics.
   Tests in `tests/test_candidates.py`.
 - `src/run_blocking_eval.py`, `src/run_blocking_test_check.py`: blocking evaluation and the test-data France check.
