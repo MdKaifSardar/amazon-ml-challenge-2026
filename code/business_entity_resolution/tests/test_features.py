@@ -8,7 +8,8 @@ import polars as pl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from features import build, count_stats, feature_names, legal_words, prepare_records  # noqa: E402
+from features import (build, count_stats, country_state_maps, feature_names, fill_record_states,  # noqa: E402
+                      find_postcode, legal_words, prepare_records)
 
 REC_SCHEMA = {"entity_id": pl.Utf8, "country": pl.Utf8, "business_address": pl.Utf8, "full_name": pl.Utf8, "core_name": pl.Utf8, "legal": pl.Utf8,
               "addr_norm": pl.Utf8, "city": pl.Utf8, "state": pl.Utf8, "dept": pl.Utf8, "numbers": pl.List(pl.Utf8)}
@@ -138,3 +139,148 @@ def test_prune_standard_matches_default_operating_point():
     assert set(out.filter(pl.col("s1") == "a")["cand"]) == {f"S2-{i:02d}" for i in range(2, 12)}  # top 10 by p_u50
     assert out.filter(pl.col("s1") == "b")["cand"].to_list() == ["S3-rev"]
     assert "p_keep" not in out.columns
+
+
+# ---------------------------------------------------------------------------- feat-v2
+
+def raw(eid, country, addr, core, city=None, state=None, dept=None, legal="", numbers=()):
+    """One normalised record (before prepare_records); full_name = core + legal."""
+    return (eid, country, addr, f"{core} {legal}".strip(), core, legal, addr.lower(), city, state, dept, list(numbers))
+
+
+def frame(rows):
+    return pl.DataFrame(rows, schema=REC_SCHEMA, orient="row")
+
+
+@pytest.mark.parametrize("components, city, expected", [
+    (["24 greenwood ln", "austin", "tx 78701"], "austin", "78701"),  # ends a component after a state word
+    (["24 greenwood ln austin tx 78701"], "austin", "78701"),  # no commas
+    (["12345 main st", "austin", "tx 78701 1234"], "austin", "78701"),  # ZIP+4; the house number is not a ZIP
+    (["12345 main st austin tx"], "austin", None),  # house number only: first token of the address
+    (["12345 broadway"], None, None),
+    (["suite 12345", "100 main st", "austin tx"], "austin", None),  # after a unit word
+    (["po box 12345", "austin"], "austin", None),
+    (["plot no 123456", "bengaluru"], "bengaluru", None),
+    (["unit 5", "12345 main st", "austin"], "austin", None),  # starts a later component, but a street follows
+    (["no 12 mg road", "bengaluru", "karnataka 560001", "india"], "bengaluru", "560001"),  # trailing country ignored
+    (["12 rue x", "02100 saint quentin", "france"], None, "02100"),  # starts a place-name component; zero kept
+    (["12 rue saint honore 02100 saint quentin"], "saint quentin", "02100"),  # right before the city
+    (["12 r saint honore", "paris"], "paris", None),
+    ([], None, None),
+])
+def test_find_postcode_by_position(components, city, expected):
+    assert find_postcode(components, city) == expected
+
+
+def test_prepare_records_postcode_from_raw_address_keeps_leading_zero():
+    rec = prepare_records(frame([raw("S2-x", "France", "3 Rue Pasteur, 02100 Saint-Quentin", "cafe", city="saint quentin"),
+                                 raw("S2-y", "US", "12345 Main St, Austin, TX", "cafe", city="austin"),
+                                 raw("S2-z", "India", "Shop 4, MG Road, Pune - 411001", "cafe", city="pune")]))
+    assert dict(zip(rec["entity_id"], rec["postcode"])) == {"S2-x": "02100", "S2-y": None, "S2-z": "411001"}
+    assert "business_address" not in rec.columns
+    assert S1.filter(pl.col("entity_id") == "S1-1")["postcode"][0] == "78701"
+
+
+def test_postcode_features(feats):
+    a, c, d = row(feats, "S2-a"), row(feats, "S2-c"), row(feats, "S3-d")
+    assert (a["f_postcode_agree"], a["f_s1_has_postcode"], a["f_cand_has_postcode"]) == (1, 1, 1)
+    assert math.isnan(c["f_postcode_agree"]) and c["f_s1_has_postcode"] == 1 and c["f_cand_has_postcode"] == 0
+    assert d["f_s1_has_postcode"] == 1 and d["f_cand_has_postcode"] == 0  # "75001 paris" starts a place component
+    assert not any(k.startswith("f_num_long") for k in feats.columns)
+
+
+def test_state_filled_like_blocking_and_dept_agreement():
+    # 25 records with city + state teach "saint quentin" -> hauts de france (blocking: >= 20 records, >= 90%).
+    loc = pl.DataFrame({"country": ["France"] * 25 + ["US"] * 25, "city": ["saint quentin"] * 25 + ["austin"] * 25,
+                        "dept": ["aisne"] * 25 + [None] * 25, "state": ["hauts de france"] * 25 + ["texas"] * 25})
+    maps = country_state_maps(loc)
+    assert set(maps) == {"France", "US"}
+    s1 = prepare_records(fill_record_states(frame([
+        raw("S1-f", "France", "1 rue x, 02100 saint quentin", "cafe du nord", "saint quentin", "hauts de france", "aisne"),
+        raw("S1-u", "US", "1 main st, austin, tx 78701", "cafe du nord", "austin", "texas"),
+    ]), maps))
+    pool = prepare_records(fill_record_states(frame([
+        raw("S2-f1", "France", "1 rue x, saint quentin", "cafe du nord", "saint quentin", None, "aisne"),  # state from city
+        raw("S3-f2", "France", "1 rue x, lille", "cafe du nord", "lille", "hauts de france", "nord"),  # other dept
+        raw("S2-f3", "France", "1 rue x", "cafe du nord"),  # no city, state or dept
+        raw("S3-u1", "US", "1 main st, austin", "cafe du nord", "austin", None),  # state from city
+        raw("S2-u2", "US", "1 main st, dallas, tx", "cafe du nord", "dallas", "oklahoma"),  # different state
+    ]), maps))
+    assert pool.filter(pl.col("entity_id") == "S2-f1")["state"][0] == "hauts de france"
+    assert "state_src" not in pool.columns
+    pairs = pl.DataFrame({"s1": ["S1-f"] * 3 + ["S1-u"] * 2, "cand": ["S2-f1", "S3-f2", "S2-f3", "S3-u1", "S2-u2"]})
+    x = build(pairs, s1, pool, count_stats([s1], [pool]))
+    st = dict(zip(x["cand"], x["f_state_agree"].to_list()))
+    dp = dict(zip(x["cand"], x["f_dept_agree"].to_list()))
+    assert st["S2-f1"] == 1 and st["S3-f2"] == 1 and math.isnan(st["S2-f3"]) and st["S3-u1"] == 1 and st["S2-u2"] == 0
+    assert dp["S2-f1"] == 1 and dp["S3-f2"] == 0 and math.isnan(dp["S2-f3"])
+    assert math.isnan(dp["S3-u1"]) and math.isnan(dp["S2-u2"])  # no departement outside France: all-NaN in train
+    assert dict(zip(x["cand"], x["f_cand_is_s3"].to_list())) == {"S2-f1": 0, "S3-f2": 1, "S2-f3": 0, "S3-u1": 1, "S2-u2": 0}
+
+
+def test_rare_word_features_use_blocking_definition():
+    s1 = prepare_records(frame([raw("S1-r", "India", "x", "zorbex food ab")]))
+    pool = prepare_records(frame([raw("S2-r1", "India", "x", "zorbex food ab"), raw("S3-r2", "India", "x", "qwilly food ab")]))
+    # "food" and "ab" are common in the country (df > 20); "zorbex" and "qwilly" are rare.
+    filler = frame([raw(f"S2-f{i}", "India", "x", "food ab") for i in range(30)])
+    x = build(pl.DataFrame({"s1": ["S1-r", "S1-r"], "cand": ["S2-r1", "S3-r2"]}), s1, pool, count_stats([s1], [pool, filler]))
+    a, b = row(x, "S2-r1"), row(x, "S3-r2")
+    assert (a["f_rare_shared"], a["f_rare_only_s1"], a["f_rare_only_cand"]) == (1, 0, 0) and a["f_rare_shared_idf"] > 0
+    assert (b["f_rare_shared"], b["f_rare_only_s1"], b["f_rare_only_cand"]) == (0, 1, 1) and b["f_rare_shared_idf"] == 0
+    assert not any(k in x.columns for k in ("f_score_rare", "f_rank_rare"))
+    # a token shorter than 3 characters is never rare, however few records have it
+    s1b = prepare_records(frame([raw("S1-s", "India", "x", "ab food")]))
+    pb = prepare_records(frame([raw("S2-s", "India", "x", "ab food")]))
+    y = build(pl.DataFrame({"s1": ["S1-s"], "cand": ["S2-s"]}), s1b, pb, count_stats([s1b], [pb]))
+    assert row(y, "S2-s")["f_rare_shared"] == 1  # "food" (df 2) is rare here, "ab" is not
+
+
+def test_counts_are_per_country_over_all_given_records():
+    us = frame([raw(f"S2-u{i}", "US", "x", "royal food") for i in range(4)])
+    india = frame([raw(f"S3-i{i}", "India", "x", "royal food") for i in range(2)])
+    st = count_stats([frame([raw("S1-1", "US", "x", "royal food")]).lazy()], [us.lazy(), india])  # lazy scans work too
+    assert st.n == {"US": 5, "India": 2}
+    n = {(c, k): (a, b) for c, k, a, b in st.name_n.select("country", "core_name", "n_s1", "n_pool").iter_rows()}
+    assert n[("US", "royal food")] == (1, 4) and n[("India", "royal food")] == (0, 2)
+    df = {(c, t): d for c, t, d in st.token_df.select("country", "t", "df").iter_rows()}
+    assert df[("US", "royal")] == 5 and df[("India", "food")] == 2
+
+
+def test_features_do_not_depend_on_other_s1_lists(feats):
+    """Counts come from the record files, not from the pairs: adding another S1 whose list shares S2-a and S3-b (as a
+    bigger query set would) changes nothing for S1-1, i.e. there is no candidate-popularity feature."""
+    extra = prepare_records(frame([raw("S1-9", "US", "24 Greenwood Ln, Austin, TX 78701", "willow", "austin", "tx",
+                                       legal="llc", numbers=["24", "78701"])]))
+    pairs = pl.concat([PAIRS, pl.DataFrame({"s1": ["S1-9", "S1-9"], "cand": ["S2-a", "S3-b"]})], how="diagonal_relaxed")
+    bigger = build(pairs, pl.concat([S1, extra]), POOL, STATS)
+    pick = lambda x, s1: x.filter(pl.col("s1") == s1).sort("cand").drop("s1", "cand").to_numpy()
+    assert np.allclose(pick(feats, "S1-1"), pick(bigger, "S1-1"), equal_nan=True)
+    alone = build(PAIRS.filter(pl.col("s1") == "S1-2"), S1, POOL, STATS)
+    assert np.allclose(pick(alone, "S1-2"), pick(feats, "S1-2"), equal_nan=True)
+
+
+def test_feature_count_and_names(feats):
+    names = feature_names(feats)
+    assert len(names) == 90 and len(set(names)) == 90
+    for f in ("f_state_agree", "f_dept_agree", "f_cand_is_s3", "f_postcode_agree", "f_s1_has_postcode",
+              "f_cand_has_postcode", "f_rare_shared", "f_rare_only_s1", "f_rare_only_cand", "f_rare_shared_idf"):
+        assert f in names, f
+
+
+def test_runner_checks_and_shift_flags(feats):
+    from run_features import checks, profile, shift_table
+    ok = checks(feats, feats.schema)
+    assert ok["same_schema_as_ref"] and ok["all_float32"] and ok["duplicate_pairs"] == 0 and ok["inf_values"] == 0
+    bad = pl.concat([feats, feats.head(1)]).with_columns(pl.lit(float("inf"), pl.Float32).alias("f_name_full_ratio"))
+    c = checks(bad, feats.schema)
+    assert c["duplicate_pairs"] == 2 and c["inf_values"] == bad.height
+    assert not checks(feats.select("s1", "cand", *feature_names(feats)[::-1]), feats.schema)["same_schema_as_ref"]
+    assert not checks(feats.with_columns(pl.col("f_p_u50").cast(pl.Float64)), feats.schema)["same_schema_as_ref"]
+    tr = feats.filter(pl.col("s1") != "S1-3")
+    prof = pl.concat([profile(tr, "train", "all"), profile(tr.filter(pl.col("s1") == "S1-1"), "train", "US"),
+                      profile(feats.filter(pl.col("s1") == "S1-3"), "test", "France"),
+                      profile(feats.filter(pl.col("s1") == "S1-1"), "test", "US")])
+    sh = shift_table(prof)
+    assert set(sh.filter(pl.col("test_country") == "France")["vs"]) == {"train all"}  # France: no train rows
+    assert set(sh.filter(pl.col("test_country") == "US")["vs"]) == {"train US"}
+    assert not sh.filter(pl.col("test_country") == "US")["flag"].any()  # identical data: no flag
