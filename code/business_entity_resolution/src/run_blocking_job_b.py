@@ -43,6 +43,11 @@ def log_mem(msg: str) -> None:
 
 
 def process_test_country(country: str, tr: dict, te: dict, model, out_dir: Path) -> Path:
+    out_file = out_dir / f"test_candidates_{country}.parquet"
+    if out_file.exists() and out_file.stat().st_size > 1024 * 1024:
+        log_mem(f"=== Test Country {country} ALREADY COMPLETED ({out_file.stat().st_size / 2**20:.1f} MB) -> SKIPPING ===")
+        return out_file
+
     log_mem(f"=== Starting Test Country: {country} ===")
     cc = lambda d: d.filter(pl.col("country") == country)
     train_all = pl.concat([cc(t) for t in tr.values()], how="diagonal_relaxed")
@@ -58,44 +63,60 @@ def process_test_country(country: str, tr: dict, te: dict, model, out_dir: Path)
     n_pool = pool.height
     log_mem(f"{country}: {n_s1:,} test S1 queries; pool {n_pool:,} records")
 
-    qmask = np.ones(n_s1, dtype=bool)
-    tim: list[dict] = []
-    long, _ = block_country(s1, pool, qmask, corpus, df_counts, k=50, m=5,
-                            scopes=("state",), log=log_mem, gpu_check=False, timing=tim,
-                            reverse_keep=qmask)
-
-    long = long.with_columns(pl.Series("s1", s1["entity_id"].to_numpy()[long["qi"].to_numpy()]),
-                             pl.Series("cand", pool["entity_id"].to_numpy()[long["pi"].to_numpy()])).drop("qi", "pi")
-    log_mem(f"{country}: raw search returned {long.height:,} rows")
-
-    # Pivot to wide format with rank/score per method
-    wide = to_wide(long)
-    del long
-    gc.collect()
-
-    # Filter to starting union u50 (fwd 50, rev 5, rare 20)
-    ukw = UNIONS["u50"]
-    u50_cand = add_list_features(wide.filter((pl.col("scope") == "state") & rule(**ukw)))
-    del wide
-    gc.collect()
-    log_mem(f"{country}: u50 starting list has {u50_cand.height:,} candidates")
-
     # Attributes for pruner scoring
     s1_attr = s1.select("entity_id", "core_name", "addr_norm", "city", "state")
     pool_attr = pool.select("entity_id", "core_name", "addr_norm", "city", "state")
-    del s1, pool, corpus, df_counts, train_all, test_all, maps
+    s1_ids = s1["entity_id"].to_numpy()
+    pool_ids = pool["entity_id"].to_numpy()
+
+    # If > 400k queries (India ~810k, US ~663k), split into 2 shards to bound memory < 22 GB
+    n_shards = 2 if n_s1 > 400_000 else 1
+    log_mem(f"{country}: processing in {n_shards} shard(s) to guarantee peak memory < 22 GB")
+
+    pruned_shards = []
+    ukw = UNIONS["u50"]
+
+    for shard in range(n_shards):
+        if n_shards > 1:
+            qmask = (np.arange(n_s1) % n_shards) == shard
+            log_mem(f"{country} Shard {shard + 1}/{n_shards}: {np.sum(qmask):,} queries")
+        else:
+            qmask = np.ones(n_s1, dtype=bool)
+
+        tim: list[dict] = []
+        long, _ = block_country(s1, pool, qmask, corpus, df_counts, k=50, m=5,
+                                scopes=("state",), log=log_mem, gpu_check=False, timing=tim,
+                                reverse_keep=qmask)
+
+        long = long.with_columns(pl.Series("s1", s1_ids[long["qi"].to_numpy()]),
+                                 pl.Series("cand", pool_ids[long["pi"].to_numpy()])).drop("qi", "pi")
+        log_mem(f"{country} shard {shard + 1}: raw search returned {long.height:,} rows")
+
+        # Pivot to wide format with rank/score per method
+        wide = to_wide(long)
+        del long
+        gc.collect()
+
+        # Filter to starting union u50 (fwd 50, rev 5, rare 20)
+        u50_cand = add_list_features(wide.filter((pl.col("scope") == "state") & rule(**ukw)))
+        del wide
+        gc.collect()
+        log_mem(f"{country} shard {shard + 1}: u50 starting list has {u50_cand.height:,} candidates")
+
+        # Score candidates using pruner model
+        p = score(model, u50_cand, s1_attr, pool_attr)
+        u50_cand = u50_cand.with_columns(pl.Series("p_u50", p))
+
+        # Apply frozen operating point: tau = 0.01, cap = 10 (ordered by p_u50)
+        shard_pruned = prune(u50_cand, p, tau=0.01, cap=10).with_columns(pl.lit(country).alias("country"))
+        pruned_shards.append(shard_pruned)
+        del u50_cand, p, shard_pruned
+        gc.collect()
+
+    del s1, pool, corpus, df_counts, train_all, test_all, maps, s1_attr, pool_attr
     gc.collect()
 
-    # Score candidates using pruner model
-    p = score(model, u50_cand, s1_attr, pool_attr)
-    u50_cand = u50_cand.with_columns(pl.Series("p_u50", p))
-
-    # Apply frozen operating point: tau = 0.01, cap = 10 (ordered by p_u50)
-    pruned = prune(u50_cand, p, tau=0.01, cap=10).with_columns(pl.lit(country).alias("country"))
-    del u50_cand, p, s1_attr, pool_attr
-    gc.collect()
-
-    out_file = out_dir / f"test_candidates_{country}.parquet"
+    pruned = pl.concat(pruned_shards)
     pruned.write_parquet(out_file)
 
     avg_cands = pruned.height / max(n_s1, 1)
