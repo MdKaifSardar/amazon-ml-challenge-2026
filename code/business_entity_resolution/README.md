@@ -1,59 +1,86 @@
 # Business Entity Resolution pipeline
 
-Status:
-- Done: data preparation, EDA, scorer and all-empty baseline; shared normalisation (norm-v3).
-- Done: blocking and candidate selection (v3). Default operating point: validation recall 96.8% at 6.6
-  candidates per S1.
-- Done: Job A candidate generation (300k training S1 sample -> 1.97M train pairs, 96.86% recall).
-- Done: Job B full test candidate generation (1.73M test S1 -> 12.67M candidate pairs, 99.98% coverage,
-  output/candidate_pairs.tsv verified, test_candidates.parquet published to Kaggle v3 dataset).
-- Next: Feature extraction on test candidates (Person 2), model scoring (Person 3), and pipeline integration.
+For every test Source 1 (S1) business, the pipeline finds the matching Source 2 / Source 3 (S2/S3) records.
+It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
+
+**Current submission:**
+- validation macro F0.5 **0.9717** (US 0.980, India 0.959);
+- candidate set of 7.3 candidates per S1 on test (validation recall 96.85% at 6.6 per S1);
+- organiser validator: PASS.
+
+Methodology: `../../Documentation_template.md`. Experiment log: `../../EXPERIMENTS.md`.
+
+## Pipeline at a glance
+```
+TSV -> Parquet -> EDA + S1-grouped split -> normalisation (norm-v3)
+    -> blocking v3: TF-IDF searches + pruner  -> candidates (train / val / test)  = candidate_pairs.tsv
+    -> pair features feat-v2 (86)             -> LightGBM (variant C) -> selection (tau 0.65, margin 0.7)
+    -> matching_results.tsv (+ candidate_pairs.tsv) -> organiser validator
+```
 
 ## Setup
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
-Optional imports, not pinned: `torch` (GPU top-k; the CPU path is used without it and was faster here) and
-`matplotlib` (the recall-vs-candidates plot). Both are preinstalled on Kaggle.
-Run all commands below from this folder (`code/business_entity_resolution/`), with the organiser data in
-`../../dataset/` (the TSVs).
+- Python 3.12+; every package the pipeline imports is pinned in `requirements.txt`.
+- Optional imports, not pinned: `torch` (GPU top-k; the CPU path is used without it and was faster here) and
+  `matplotlib` (one plot in the blocking report).
+- Tests: `python -m pytest tests` (pytest is a dev tool, not a pipeline dependency).
+- No external data, APIs or pretrained models are used. The only models are trained here from the provided
+  training data: LightGBM (MIT licence) and a scikit-learn HistGradientBoosting pruner (BSD-3-Clause).
 
-## Steps
-1. Convert the TSVs to Parquet (all columns as strings):
-   `python src/convert_to_parquet.py --tsv-dir ../../dataset --out-dir ../../data_parquet`
-2. Optional, for local smoke tests: a 1% structure-preserving sample:
-   `python src/make_sample.py --in-dir ../../data_parquet --out-dir ../../data_sample`
-3. EDA and the S1-grouped train/validation split (`g25_split.parquet`). The full data needs ~20 GB RAM (run on Kaggle):
-   `python src/eda.py --data-dir ../../data_parquet --out-dir ../../outputs/eda`
-4. Normalisation of every source file (state aliases learned from train pairs excluding validation S1, city
-   vocabulary from train + test records, quality report). The full data runs on Kaggle (~10 GB RAM):
-   `python src/run_normalise.py --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../artifacts/normalised`
-   Outputs `normalised/{split}_source{k}.parquet` (raw + normalised columns), `state_aliases_norm-v3.json`,
-   `city_vocab_norm-v3.parquet` and `normalisation_report.md`. Rules and lists: `docs/normalisation.md`.
-5. All-empty baseline: scores the validation split and writes an all-empty test submission:
-   `python src/baseline_empty.py --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../output`
+Run every command below **from this folder** (`code/business_entity_resolution/`), with the organiser data in
+`../../dataset/{train,test}/*.tsv`.
 
-6. Blocking and candidate selection. The full data runs on Kaggle as pieces (CPU is faster than GPU here):
-   - search, one piece per country and side:
-     `python src/run_blocking_eval.py --stage search --side train --countries India --scopes state ...`
-     (`--side test` queries test S1; `--shard i/n` splits further);
-   - evaluate: merges the pieces, trains the pruner, reports recall vs candidates per S1 and the operating points:
-     `python src/run_blocking_eval.py --stage evaluate --pieces <dirs> --scopes state ...`;
-   - France / test check, no labels:
-     `python src/run_blocking_test_check.py --pieces <dirs> --model-dir <evaluate output>`.
-   Kaggle jobs: `blocking-train-india`, `blocking-train-us`, `blocking-test-france`, `blocking-test-usin`,
-   `blocking-eval-v3`, `blocking-test-check`. Results are in `EXPERIMENTS.md`.
-7. Pair features (table 6) for train, val and test, one country at a time, with checks (schema, duplicates, inf,
-   NaN share and median per split x country, test-vs-train shift flags) and per-feature AUC on the labelled splits:
-   `python src/run_features.py --input <dir with *_candidates.parquet and normalised/> --out-dir <out> --splits train val test --prune val`
-   (`--prune val`: the blocking-eval-v3 val table is the unpruned starting list; train and test are already pruned).
+**Input search:** several scripts search their `--input` / `--norm-dir` folder recursively and take the first
+file with the expected name. Keep only one copy of each file under those folders (e.g. no old smoke-test
+outputs).
 
-7. Model + selection + test outputs (Kaggle CPU job `model-v1`, ~50 min): LightGBM variants, F0.5-tuned selection,
-   France checks, both output files and the validator:
-   `python src/run_model.py --input <folder with features-v2, blocking-v3 candidates, split, raw data> --out-dir DIR --validator ../../utils/validate_submission.py`
-   Current submission: variant C, tau 0.65, margin 0.7, validation macro F0.5 0.9717.
+## Reproduce end to end
+The seeds are fixed (42). Runtimes and peak RAM are from our runs:
+- Kaggle CPU sessions: 4 cores, ~30 GB;
+- AWS EC2 for Jobs A and B: c6i.2xlarge (8 vCPU, 15 GB + swap) and r6i.2xlarge (8 vCPU, 64 GB).
 
-## Shared table formats (interfaces between the streams)
+`jobs/` in the repository holds the Kaggle notebooks that ran each step; each embeds the script verbatim.
+
+| # | step | command | runtime / peak RAM | outputs |
+|---|---|---|---|---|
+| 1 | TSV -> Parquet (all columns as strings) | `python src/convert_to_parquet.py --tsv-dir ../../dataset --out-dir ../../data_parquet` | minutes / low | `data_parquet/{train,test}/*.parquet` |
+| 2 | EDA + S1-grouped split (5 folds; val = fold 0) | `python src/eda.py --data-dir ../../data_parquet --out-dir ../../outputs/eda` | 7 min / 18 GB | `outputs/eda/g25_split.parquet` |
+| 3 | normalisation norm-v3 (state aliases from non-validation train pairs; city vocabulary from train + test records) | `python src/run_normalise.py --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../artifacts/normalised` | 18 min / 12 GB | `artifacts/normalised/normalised/{train,test}_source{1,2,3}.parquet`, `state_aliases_norm-v3.json` |
+| 4a | blocking search, validation + 100k train S1 (pruner data), one country per run | `python src/run_blocking_eval.py --stage search --side train --countries India --scopes state --norm-dir ../../artifacts/normalised --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../artifacts/blocking_eval` (then the same with `--countries US`) | 39 + 46 min / 18 GB | `artifacts/blocking_eval/pieces/piece_train_*.parquet` |
+| 4b | blocking evaluate: pruner training, operating points, validation candidates | `python src/run_blocking_eval.py --stage evaluate --pieces ../../artifacts/blocking_eval/pieces --scopes state --norm-dir ../../artifacts/normalised --data-dir ../../data_parquet --split ../../outputs/eda/g25_split.parquet --out-dir ../../artifacts/blocking_eval` | 25 min / 23 GB | `pruner_state_u50.pkl`, `config.json`, `val_candidates.parquet` (unpruned starting list), report |
+| 5 | Job A: train candidates for all 299,728 train-split S1 (frozen v3 rule: u50, pruner tau 0.01, cap 10) | `python src/run_blocking_job_a.py --norm-dir ../../artifacts/normalised --split ../../outputs/eda/g25_split.parquet --data-dir ../../data_parquet --model-dir ../../artifacts/blocking_eval --out-dir ../../artifacts/blocking_eval` | 56 min / ~15 GB (8 vCPU) | `artifacts/blocking_eval/train_candidates.parquet` |
+| 6 | Job B: test candidates for all 1,732,544 test S1 (same rule) | `python src/run_blocking_job_b.py --norm-dir ../../artifacts/normalised --model-dir ../../artifacts/blocking_eval --out-dir ../../artifacts/blocking_eval --tsv-out ../../artifacts/blocking_eval/job_b_pairs.tsv` | 99 min / **34 GB** | `artifacts/blocking_eval/test_candidates.parquet` (the `--tsv-out` file is a pair list for inspection, **not** the official format) |
+| 7 | pair features feat-v2 for train, val (pruned to the submitted set) and test | `python src/run_features.py --input ../../artifacts --out-dir ../../artifacts/features --splits train val test --prune val` | 28 min / 14 GB | `artifacts/features/features_{train,val,test}.parquet`, report |
+| 8 | model + selection + both output files + validator (see below for the input folder) | `python src/run_model.py --input ../../artifacts/model_input --out-dir ../../artifacts/model --validator ../../utils/validate_submission.py` | 51 min / 9 GB | `artifacts/model/output/{matching_results,candidate_pairs}.tsv`, `model_C.txt`, `selection_config.json`, `model_report.md` |
+| 9 | copy the outputs and validate | `cp ../../artifacts/model/output/*.tsv ../../output/ && python3 ../../utils/validate_submission.py --matching ../../output/matching_results.tsv --candidate ../../output/candidate_pairs.tsv --test-dir ../../dataset/test` | seconds | `output/` (PASS) |
+
+Step 8 reads one folder. Link the inputs into it, so each file exists once:
+```bash
+M=../../artifacts/model_input && mkdir -p $M
+ln -sf "$(realpath ../../outputs/eda/g25_split.parquet)" $M/
+for f in train_source1 train_ground_truth; do ln -sf "$(realpath ../../data_parquet/train/$f.parquet)" $M/; done
+for k in 1 2 3; do ln -sf "$(realpath ../../data_parquet/test/test_source$k.parquet)" $M/; done
+for s in train val test; do ln -sf "$(realpath ../../artifacts/blocking_eval/${s}_candidates.parquet)" $M/;
+                           ln -sf "$(realpath ../../artifacts/features/features_$s.parquet)" $M/; done
+```
+
+Notes:
+- Steps 4–6 are the frozen blocking v3.
+  - Step 4 alone (`--stage all`) also runs on a laptop-sized sample from `src/make_sample.py`.
+  - `src/run_blocking_test_check.py` (France check on test data) and `src/write_candidates.py` (candidate file
+    and validator from the blocking output alone) are diagnostics, not needed for the outputs.
+- Step 6 needs ~34 GB RAM as written. On a ~30 GB machine, run it per country.
+- Step 8 trains four LightGBM variants (A, B, C and A_all) and picks one with a fixed rule. The rule: the most
+  France-robust variant within 0.5 F0.5 points of the best on the validation report half.
+  - The submitted choice is C: 82 features, without f_n_methods and the pruner-derived scores.
+  - `--variants C` trains only the chosen variant (~7 min instead of 30).
+- `candidate_pairs.tsv` = the test candidate set of step 6: exactly the pairs the model scores. Matches are
+  always a subset of it (checked when writing).
+- Every test S1 appears in both files; 280 S1 without candidates have empty lists.
+
+## Shared table formats (interfaces between the stages)
 All tables are Parquet with string ids. `s1` = Source 1 entity_id and `cand` = S2/S3 entity_id. The pair key
 everywhere is `(s1, cand)`.
 
@@ -74,9 +101,9 @@ Rules for every stream:
 - Tune on validation, never on test.
 - Keep features and rules country-agnostic (France exists only in test).
 
-Known issue for model training: the saved pruners (`pruner_state_u*.pkl`) were trained on 100k train-split S1,
-so their scores on those S1 are in-sample (too confident). Train the model on other train-split S1, or use
-cross-fitted pruner scores.
+Pruner overlap: the saved pruners (`pruner_state_u*.pkl`) were trained on 100k train-split S1, so their scores
+on those S1 are in-sample. `run_model.py` therefore trains on the other ~200k train S1 (variant A_all, with all
+S1, scores only +0.0005 higher on validation, so the effect is small).
 
 ## Modules
 - `src/metric.py`: macro F0.5 exactly as the challenge defines it (tests in `tests/test_metric.py`, run with `python -m pytest tests`).
