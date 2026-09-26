@@ -40,7 +40,8 @@ NORM_COLS = ["entity_id", "country", "full_name", "core_name", "legal", "addr_no
 # dept is read only to fill missing states (fill_states); it is not a feature.
 DROP_NOTE = ("No departement or postcode feature (dropped after features-v2-sample): French S1 never has a departement "
              "detected, and 5-6 digit postcodes appear in ~0.1% of addresses (most such numbers are US house numbers). "
-             "The departement still counts through the state filling behind f_state_agree.")
+             "Missing states behind f_state_agree are filled from the city only: no departement -> state map passes "
+             "blocking's thresholds (0 in every country; see the state maps line in the log).")
 SHIFT_NAN, SHIFT_MED = 0.10, 0.25  # flag: NaN share moves >= 0.10, or the median moves >= 0.25 x the reference p10-p90 range
 P_NOTE = ("f_p_u50, f_p_gap and f_list_rank come from the blocking pruner, which was trained on 100k train-split S1: "
           "for those S1 they are in-sample (too confident). Train the model on other train S1 or drop these columns for them.")

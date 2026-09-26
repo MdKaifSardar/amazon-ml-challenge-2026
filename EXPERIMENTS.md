@@ -233,8 +233,9 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
 - **2026-09-26, feat-v2 code + sample run, Kaggle CPU `ananyaghosh09/features-v2-sample`** (`src/run_features.py
   --splits train val test --prune val --sample-s1 3000`; 147 s in total, peak 7.5 GB). No model, so no val F0.5.
   - Changes from feat-v1, agreed with the team:
-    - `f_state_agree` (1 same / 0 different / NaN missing). Missing states are filled from the city, then the
-      département, with blocking's `state_maps` / `fill_states`, learned per country on all train + test records.
+    - `f_state_agree` (1 same / 0 different / NaN missing). Missing states are filled with blocking's
+      `state_maps` / `fill_states` (city -> state, then dept -> state), learned per country on all train + test
+      records. On the real data only city maps are learned (see the correction under the full run).
     - `f_cand_is_s3` (source flag; README table 6 updated).
     - `f_rare_shared`, `f_rare_only_s1`, `f_rare_only_cand`, `f_rare_shared_idf` (blocking's rare-token definition:
       document frequency <= 20 in the country, 3+ characters) replace `f_score_rare` / `f_rank_rare` (98% NaN).
@@ -263,7 +264,7 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     NaN ~10% vs 25% in train), fewer blocking methods per candidate (median 2 vs 4), and several 0/1 features flip
     their median (train lists are ~51% positives; test lists are longer).
   - **Decision (team): drop `f_dept_agree` and all postcode features** (`f_postcode_agree`, `f_s1_has_postcode`,
-    `f_cand_has_postcode`; `find_postcode` removed). The département still counts through the state filling.
+    `f_cand_has_postcode`; `find_postcode` removed).
     **feat-v2 = 86 features.** Unit tests 93 passed.
 - **2026-09-26, feat-v2 full run, Kaggle CPU `ananyaghosh09/features-v2`** (`src/run_features.py --splits train val
   test --prune val`; 1,703 s = 28 min in total, peak 13.8 GB during test India). No model, so no val F0.5.
@@ -287,4 +288,11 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
       name+address / reverse searches. This is a blocking fact, not a feature bug; the model sees NaN there.
     - India / US: only 0/1 or count features whose median flips (number first-equal, only-S1 / only-cand, last
       name token), consistent with test lists being longer (7.3 vs 6.6) and so holding a smaller share of matches.
-  - Next: publish as the Kaggle dataset `amazon-ml-2026-features-v2` (New Dataset from the notebook output).
+  - **Correction (state filling):** the log's state maps are city -> state US 20,586 / India 5,031 / France 15
+    and **dept -> state 0 in every country** (no département passes blocking's >= 20 records, >= 90% rule). So
+    missing states come from the city only, and the département plays no part in `f_state_agree`. Earlier notes
+    said it did; they are corrected in the code, README and this log. The published `features_report.md` still
+    carries the old sentence ("the departement still counts through the state filling"); the feature values are
+    unaffected.
+  - Published as the Kaggle dataset `ananyaghosh09/amazon-ml-2026-features-v2` (from the notebook output; all 9
+    files: features_{train,val,test}.parquet, report, config, profile, shift and the two AUC CSVs).

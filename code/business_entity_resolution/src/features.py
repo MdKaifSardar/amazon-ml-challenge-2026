@@ -20,11 +20,12 @@ Groups:
 2. rare words: core-name tokens that are rare in the country (document frequency <= RARE_DF and 3+ characters,
    the definition of blocking's rare-token search): shared, only on one side, and how rare the rarest shared one is.
 3. legal form: agreement of the edge legal form (`legal`) and of legal words found anywhere in the name.
-4. address: fuzzy similarities; city and state agreement (missing states filled in from the city, then the
-   département, as in blocking); city found in the other address; number tokens (shared, conflicting,
-   first/last). No département or postcode feature: on real data they almost never fire (features-v2-sample:
-   French S1 never has a département; 5-6 digit postcodes are in ~0.1% of addresses, most such numbers being
-   US house numbers). The département still counts through the state filling.
+4. address: fuzzy similarities; city and state agreement (missing states filled with blocking's maps: city ->
+   state, then dept -> state; on the real data no dept -> state map passes blocking's thresholds, 0 in every
+   country, so in practice missing states come from the city only); city found in the other address; number
+   tokens (shared, conflicting, first/last). No département or postcode feature: on real data they almost never
+   fire (features-v2-sample: French S1 never has a département; 5-6 digit postcodes are in ~0.1% of addresses,
+   most such numbers being US house numbers).
 5. blocking: scores, ranks, gaps to the S1's best, number of methods, pruner score and list position. The rare
    method's score/rank are left out (98% NaN, no signal); the rare-word group replaces them.
 6. context: name frequency in the country; the pair's value minus the best OTHER candidate of the same S1;
@@ -72,7 +73,8 @@ def country_state_maps(loc: pl.DataFrame) -> dict[str, dict[str, pl.DataFrame]]:
 
 
 def fill_record_states(rec: pl.DataFrame, maps: dict[str, dict[str, pl.DataFrame]]) -> pl.DataFrame:
-    """Missing states filled from city, then département, per country (blocking.fill_states). Row order is not kept."""
+    """Missing states filled from city, then département, per country (blocking.fill_states; on the real data the
+    département map is empty, so only the city fills states). Row order is not kept."""
     parts = [fill_states(g, maps[c]) if c in maps else g for (c,), g in rec.group_by("country")]
     return pl.concat(parts, how="diagonal_relaxed").drop("state_src", strict=False) if parts else rec
 
