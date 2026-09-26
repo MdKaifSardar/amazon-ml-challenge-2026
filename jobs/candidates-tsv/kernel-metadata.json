@@ -1,0 +1,16 @@
+{
+  "id": "sayanchatterjee264/candidates-tsv",
+  "title": "candidates-tsv",
+  "code_file": "candidates-tsv.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sayanchatterjee264/amazon-ml-2026",
+    "mdkaifsardar/amazon-ml-2026-blocking-v3"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

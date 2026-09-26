@@ -4,8 +4,10 @@ Status:
 - Done: data preparation, EDA, scorer and all-empty baseline; shared normalisation (norm-v3).
 - Done: blocking and candidate selection (v3). Default operating point: validation recall 96.8% at 6.6
   candidates per S1.
-- Next, four parallel streams (see "Shared table formats"): pair features, model + selection, test pipeline
-  + output files, and documentation.
+- Done: Job A candidate generation (300k training S1 sample -> 1.97M train pairs, 96.86% recall).
+- Done: Job B full test candidate generation (1.73M test S1 -> 12.67M candidate pairs, 99.98% coverage,
+  output/candidate_pairs.tsv verified, test_candidates.parquet published to Kaggle v3 dataset).
+- Next: Feature extraction on test candidates (Person 2), model scoring (Person 3), and pipeline integration.
 
 ## Setup
 ```bash
