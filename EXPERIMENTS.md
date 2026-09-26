@@ -221,11 +221,12 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
 - **2026-09-26, feat-v1 full run, Kaggle CPU `ananyaghosh09/features-v1`** (`src/run_features.py --prune val`;
   421 s in total, peak 6.4 GB). Outputs: `features_train.parquet` (1,967,275 pairs, 299,670 S1) and
   `features_val.parquet` (656,181 pairs, 99,975 S1), each `s1, cand` + 84 `f_*`. Also the report, config and AUC CSVs.
-  - Val cut from the 11,776,475-pair starting list to the submitted set: positives 337,282 → 334,945, i.e. 96.85%
+  - Val pruned to the submitted set: 11,776,475 → 656,181 pairs. Positives 337,282 → 334,945, i.e. 96.85%
     of the 345,837 true val pairs, the same as the blocking v3 result. Lists now match train: 6.56 per S1
     (median 6, p95 10, max 10) in both splits.
   - Train and val AUC per feature agree within 0.005 for every feature, so there is no split shift. No feature is
     all-NaN.
   - Strongest features: p_u50 0.96, long-number shared 0.93, number jaccard 0.92, first number equal 0.85,
     name+address score 0.82, address token set 0.82.
-  - Still no val F0.5: that needs stream B's model. Published as Kaggle dataset `amazon-ml-2026-features-v1`.
+  - Still no val F0.5: that needs stream B's model. Outputs published as the Kaggle dataset
+    `amazon-ml-2026-features-v1` (created from the notebook output; features_train/val.parquet, report, config).
