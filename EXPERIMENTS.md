@@ -197,3 +197,17 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - India: **93.97%** (390,639 / 415,712; matches 94.0% benchmark).
     - US: **98.80%** (614,067 / 621,555; matches 98.8% benchmark).
   - Pruner separation: True match median p_u50 = 0.9744 vs negative decoy median p_u50 = 0.0731.
+
+- **2026-09-26, Job B: Full test candidate generation on 1.73M test S1** (`code/business_entity_resolution/src/run_blocking_job_b.py`).
+  Executed on AWS EC2 `r6i.2xlarge` (8 dedicated vCPUs, 64 GiB RAM), runtime 5,943 s (~99 min).
+  Output: `artifacts/blocking_eval/test_candidates.parquet` (12,666,305 rows, 474 MB) and `output/candidate_pairs.tsv` (12,666,305 pairs, 312 MB).
+  Published as Version 2 of Kaggle dataset `mdkaifsardar/amazon-ml-2026-blocking-v3`.
+  - Input: 1,732,544 test S1 query entities across France (259k), India (810k), and US (663k) against full test pool (12.3M records).
+  - Setup: Sequential country processing with 2-shard query chunking for India and US. Peak RAM 33.6 GB (zero swapping).
+  - Candidate set size: 12,666,305 pairs across 1,732,264 unique S1 (99.98% coverage, only 0.02% empty).
+    - France: 1,953,139 candidates for 259,452 queries (avg 7.53, 33.28% at cap 10).
+    - India: 6,205,439 candidates for 809,706 queries (avg 7.66).
+    - US: 4,507,727 candidates for 663,106 queries (avg 6.80, 17.13% at cap 10).
+    - Overall: avg 7.31 candidates per S1 (within 6.5–7.5 target range).
+  - Submissions: `output/candidate_pairs.tsv` downloaded locally and verified against competition schema.
+
