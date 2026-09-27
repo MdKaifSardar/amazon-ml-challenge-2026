@@ -84,11 +84,19 @@ def main() -> None:
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--skip-test", action="store_true")
     ap.add_argument("--pruner-s1", type=int, default=100_000)
+    ap.add_argument("--extra", action="store_true", help="swap in the India extra-candidate lists (run_india_extra.py outputs)")
     a = ap.parse_args()
     out = a.out_dir
     out.mkdir(parents=True, exist_ok=True)
     rd = lambda name, cols=None, parent=None: pl.read_parquet(find(a.input, name, parent), columns=cols)
     raw = lambda name: sorted(p for p in a.input.rglob(name) if p.parent.name != "normalised")[0]  # organiser copy, not norm-v3
+    # base files (features-v2, blocking v3) vs the India extra outputs (features_extra/, aug/), never mixed up
+    base = lambda name, cols=None: pl.read_parquet(sorted(p for p in a.input.rglob(name) if p.parent.name not in ("features_extra", "aug"))[0], columns=cols)
+    xtra = lambda name, parent, cols=None: pl.read_parquet(find(a.input, name, parent), columns=cols)
+
+    def swap(df: pl.DataFrame, new: pl.DataFrame) -> pl.DataFrame:
+        """Replace the rows of every S1 present in `new` (whole lists) by `new`."""
+        return pl.concat([df.join(new.select("s1").unique(), on="s1", how="anti"), new.select(df.columns)])
 
     # ------------------------------------------------------------------ data
     split = rd("g25_split.parquet")
@@ -103,14 +111,23 @@ def main() -> None:
     half = pl.col("s1").str.extract(r"(\d+)$").cast(pl.Int64) % 2
     s1_tune, s1_rep = val_s1.filter(half == 0), val_s1.filter(half == 1)
 
-    ftr = rd("features_train.parquet")
+    ftr = base("features_train.parquet")
     feats = feature_sets(ftr.columns)["C"]
-    ftr = ftr.join(rd("train_candidates.parquet", ["s1", "cand", "is_match"]), on=["s1", "cand"], how="left")
+    labels = base("train_candidates.parquet", ["s1", "cand", "is_match"])
+    if a.extra:
+        ftr = swap(ftr, xtra("features_train.parquet", "features_extra"))
+        labels = swap(labels, xtra("train_candidates.parquet", "aug", ["s1", "cand", "is_match"]))
+    ftr = ftr.join(labels, on=["s1", "cand"], how="left")
+    assert ftr["is_match"].null_count() == 0, "train pairs without a label"
     ftr = ftr.filter(~pl.col("s1").is_in(pruner_s1.implode())).sort("s1", "cand")
     y = ftr["is_match"].cast(pl.Int8).to_numpy()
-    fva = rd("features_val.parquet").sort("s1", "cand")
+    fva = base("features_val.parquet")
+    if a.extra:
+        fva = swap(fva, xtra("features_val.parquet", "features_extra"))
+    fva = fva.sort("s1", "cand")
     fva = fva.join(truth.with_columns(pl.lit(True).alias("is_match")), on=["s1", "cand"], how="left").with_columns(pl.col("is_match").fill_null(False))
-    log(f"train {ftr.height:,} pairs / {ftr['s1'].n_unique():,} S1; val {fva.height:,} pairs; {len(feats)} features (set C)")
+    log(f"train {ftr.height:,} pairs / {ftr['s1'].n_unique():,} S1; val {fva.height:,} pairs; {len(feats)} features (set C); "
+        f"extra={a.extra}; val blocking recall {fva['is_match'].sum() / truth.height:.4f}")
 
     # candidate records (S2/S3) for set features and examples
     cols = ["entity_id", "business_name", "business_address", "full_name", "addr_norm", "numbers"]
@@ -193,7 +210,10 @@ def main() -> None:
 
     # ------------------------------------------------------------------ test
     if not a.skip_test:
-        fte = rd("features_test.parquet").sort("s1", "cand")
+        fte = base("features_test.parquet")
+        if a.extra:
+            fte = swap(fte, xtra("features_test.parquet", "features_extra"))
+        fte = fte.sort("s1", "cand")
         tids = fte["cand"].unique().implode()
         rec_te = pl.concat([pl.scan_parquet(find(a.input, f"test_source{k}.parquet", "normalised")).select(cols)
                             .filter(pl.col("entity_id").is_in(tids)).collect() for k in (2, 3)])
@@ -208,8 +228,11 @@ def main() -> None:
                 pl.Series("p", np.mean([predict(b, mt) for b in models2[:nm]], axis=0)))
         matched = select(st, tau=cfg["tau"], margin=cfg["margin"], one_owner=True, tau2=cfg["tau2"])
         s1_all = pl.read_parquet(raw("test_source1.parquet"), columns=["entity_id", "country"]).rename({"entity_id": "s1"})
-        cand = rd("test_candidates.parquet", ["s1", "cand", "p_u50"])
-        lists = cand.sort(["s1", "p_u50", "cand"], descending=[False, True, False]).group_by("s1", maintain_order=True).agg(pl.col("cand"))
+        cand = base("test_candidates.parquet", ["s1", "cand", "p_u50"])
+        if a.extra:
+            cand = swap(cand, xtra("test_candidates.parquet", "aug", ["s1", "cand", "p_u50"]))
+        assert cand.select("s1", "cand").sort("s1", "cand").equals(fte.select("s1", "cand")), "candidate file != scored pairs"
+        lists = cand.sort(["s1", "p_u50", "cand"], descending=[False, True, False], nulls_last=True).group_by("s1", maintain_order=True).agg(pl.col("cand"))
         ml = matched.sort(["s1", "p"], descending=[False, True]).group_by("s1", maintain_order=True).agg(pl.col("cand"))
         write_submission(out / "output", s1_all["s1"].to_list(), dict(zip(ml["s1"].to_list(), ml["cand"].to_list())),
                          dict(zip(lists["s1"].to_list(), lists["cand"].to_list())))
