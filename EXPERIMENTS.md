@@ -8,6 +8,7 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
 | 2026-09-25 13:05 | All-empty baseline (`src/baseline_empty.py`) | n/a (no candidates) | 0.0559 | 0.0562 / 0.0554 | 1.0 / 0.0 | Reference |
 | 2026-09-27 01:10 | LightGBM variant C on feat-v2 + selection (tau 0.65, margin 0.7), Kaggle `model-v1` | 0.9685 (candidate set, 6.56 per S1) | **0.9717** (report half) | 0.9804 / 0.9586 | 0.9677 / 0.9720 | **Kept** (first submission) |
 | 2026-09-27 13:20 | Two-stage model (stage-1 OOF C + set features, 3 seeds), tau 0.55, margin 0.7, one owner (always on test), Kaggle `model-v2` | 0.9685 (unchanged) | **0.9742** (report half) | 0.9830 / 0.9610 | – | **Kept** (upload 2) |
+| 2026-09-27 16:55 | v3: + targeted B features (18), tuned LightGBM (63 leaves, min_data 400, ff 0.6, l1 1, l2 1, lr 0.08), 5 seeds; tau 0.5, margin 0.7, one owner; Kaggle `model-v3-exp` | 0.9685 (unchanged) | **0.9747** (report half) | 0.9835 / 0.9615 | – | **Kept** (+0.05 pt, small) |
 
 ## Run log
 
@@ -441,3 +442,38 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     - A French by-eye check (10 S1): mostly correct. Some likely decoys got through: same address, differing
       descriptor word ("Domicile Aida Amicale SARL" for "Domicile Aida Ehpad SARL", p 0.95; "HEART PARENTS" for
       "Heart Comite SAS", p 0.94).
+
+- **2026-09-27, model v3 experiments: steps A + B** (`src/pair_extra.py`, `src/run_model_v3.py`; Kaggle CPU
+  `model-v3-exp`, 2 h). Blocking, candidates and features-v2 are unchanged; stage 1 and the set features are as in v2.
+  - Step B, targeted features (18 columns, all counts over train + test records, no labels):
+    - b1 descriptor-word difference (legal words removed; descriptor list in English + French; IDF size);
+    - b2 legal form different + same address;
+    - b3 empty address + near-identical name + name rarity in the state;
+    - b4 trade name (same address and house number, low name similarity) + address rarity.
+
+    | stage 2 (1 seed, v2 params) | report F0.5 | US | India | precision |
+    |---|---|---|---|---|
+    | v2 features (C + set) | 0.9740 | 0.9827 | 0.9609 | 0.9940 |
+    | + b1 | 0.9742 | 0.9829 | 0.9612 | 0.9938 |
+    | + b2 | 0.9742 | 0.9830 | 0.9610 | 0.9940 |
+    | + b3 | 0.9739 | 0.9827 | 0.9607 | 0.9951 |
+    | + b4 | 0.9742 | 0.9830 | 0.9609 | 0.9957 |
+    | + all B | 0.9744 | 0.9831 | 0.9613 | 0.9942 |
+
+    Error groups (report half, v2 -> + all B):
+    - empty address + near-identical name, recall 57.5% -> 57.4% (unchanged; still the hardest group);
+    - trade name at the same address + number, recall 96.0% -> 96.7%;
+    - legal form differs at the same address, FP rate 0.45% -> 0.45%;
+    - descriptor-word difference at the same address, FP rate 1.35% -> 1.12%.
+  - Step A:
+    - 20 random LightGBM trials (tune half, after selection); best: 63 leaves, min_data_in_leaf 400,
+      feature_fraction 0.6, bagging 1.0, L1 1, L2 1, lr 0.08. All top trials are within 0.0001 of each other.
+    - 5 seeds of the tuned model: **report 0.9747** (US 0.9835, India 0.9615, precision 0.9943). Beats v2 overall
+      and in both countries (+0.05 pt): **kept**.
+    - CatBoost 1.2.10 (Apache-2.0) alone: 0.9742.
+    - Blends: mean probability 0.9745, rank mean 0.9743. Neither beats the tuned LightGBM on the tune half, so no
+      blend is used.
+  - Conclusion: the model side is close to saturated on these candidates and features (every variant is within
+    0.9739–0.9747). The largest remaining model-side group is empty-address pairs (57% recall), which the data
+    cannot separate from same-name decoys without an address.
+  - Step C (cross-encoder score): no scores arrived, so skipped.
