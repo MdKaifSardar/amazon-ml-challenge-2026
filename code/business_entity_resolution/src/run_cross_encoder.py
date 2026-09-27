@@ -205,8 +205,17 @@ def main():
     # 2. Load Train Candidates for 2-Fold OOF Training
     log("Loading train candidates...")
     train_cands = pl.read_parquet(find_file(input_dir, "train_candidates.parquet"))
-    if "label" not in train_cands.columns:
-        raise ValueError("train_candidates.parquet must contain 'label' column")
+    label_col = "is_match" if "is_match" in train_cands.columns else ("label" if "label" in train_cands.columns else None)
+    if label_col:
+        train_cands = train_cands.with_columns(pl.col(label_col).cast(pl.Int32).alias("label"))
+    else:
+        log("Attaching ground truth labels from train_ground_truth.parquet...")
+        truth = pl.read_parquet(find_file(input_dir, "train_ground_truth.parquet"))
+        train_cands = train_cands.join(
+            truth.select(["s1", "cand"]).with_columns(pl.lit(1).alias("label")),
+            on=["s1", "cand"],
+            how="left",
+        ).with_columns(pl.col("label").fill_null(0).cast(pl.Int32))
 
     pos = train_cands.filter(pl.col("label") == 1)
     neg = train_cands.filter(pl.col("label") == 0).sample(n=min(len(pos) * 3, args.sample_train * 2), seed=SEED)
