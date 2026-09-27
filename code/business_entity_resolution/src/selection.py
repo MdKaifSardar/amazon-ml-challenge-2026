@@ -21,11 +21,24 @@ MARGINS = [0.0, 0.3, 0.5, 0.7]
 BETA2 = 0.25
 
 
-def select(scored: pl.DataFrame, tau: float, margin: float = 0.0, one_owner: bool = True) -> pl.DataFrame:
-    """scored: s1, cand, p. Returns the kept (s1, cand, p) rows."""
-    x = scored.filter(pl.col("p") >= tau)
+def select(scored: pl.DataFrame, tau: float, margin: float = 0.0, one_owner: bool = True, tau2: float | None = None,
+           sim: float = 0.9, owner_delta: float = 0.0) -> pl.DataFrame:
+    """scored: s1, cand, p (+ s_sim_name, s_num_eq for the secondary rule). Returns the kept (s1, cand, p) rows.
+    tau2: also keep a pair with tau2 <= p < tau if it strongly resembles a confident candidate of the same S1
+    (s_sim_name >= sim and the same first house number). owner_delta: with one_owner, an S2/S3 claimed by two S1
+    goes to the higher p only if it leads by more than owner_delta; otherwise it is dropped from both."""
+    keep = pl.col("p") >= tau
+    if tau2 is not None and tau2 < tau:
+        keep = keep | ((pl.col("p") >= tau2) & (pl.col("s_sim_name") >= sim) & (pl.col("s_num_eq") >= 1)).fill_null(False)
+    x = scored.filter(keep)
     if one_owner:  # ties: the smaller s1 id wins (deterministic)
-        x = x.sort(["cand", "p", "s1"], descending=[False, True, False]).unique("cand", keep="first", maintain_order=True)
+        x = x.sort(["cand", "p", "s1"], descending=[False, True, False])
+        if owner_delta > 0:
+            lead = pl.col("p") - pl.col("p").shift(-1).over("cand")
+            x = x.with_columns(pl.int_range(pl.len()).over("cand").alias("_r"), lead.fill_null(1.0).alias("_lead"))
+            x = x.filter((pl.col("_r") == 0) & (pl.col("_lead") > owner_delta)).drop("_r", "_lead")
+        else:
+            x = x.unique("cand", keep="first", maintain_order=True)
     if margin > 0:
         x = x.filter(pl.col("p") >= margin * pl.col("p").max().over("s1"))
     return x.select("s1", "cand", "p")
