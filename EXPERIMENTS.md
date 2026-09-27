@@ -378,3 +378,17 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
   - Output files: organiser validator 0 errors / 0 warnings on Kaggle (`--check-ids`) and PASS locally
     (`dataset/test`). `matching_results.tsv`: 1,628,422 non-empty rows, 104,122 empty; `candidate_pairs.tsv`: the
     blocking v3 set, 280 empty. Local copies are in `output/`.
+- **2026-09-27, India extra candidates (consonant-skeleton transliteration search)** (`src/run_india_extra.py`,
+  Kaggle CPU `india-extra`, 36 min). Blocking v3 is unchanged; this is an extra source for India only.
+  - Method:
+    - core-name skeleton: aspirates merged, w -> v, z -> s, vowels after the first letter dropped, repeated letters
+      collapsed ("sharmaa tredars" -> "srm trdrs");
+    - TF-IDF char 2-3-grams within state buckets, top 10;
+    - only pairs not already in v3, cut (N, t) tuned on validation with at most 1.5 extra per India S1.
+  - Best allowed (N = 3, t = 0.9):
+    - India validation blocking recall 93.97% -> 94.26% (+0.29 pt);
+    - Indian-script 83.74% -> 84.35%;
+    - +1.48 candidates per India S1 (test: +1.22M pairs); only 0.7% of the new pairs are true matches.
+  - Features-v2 on the affected lists passed all checks.
+  - **Dropped:** about +0.1 pt of overall recall for ~10% more candidates, which the ranking penalises. India's
+    missing pairs are mostly not spelling / transliteration variants of the name.
