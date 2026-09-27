@@ -3,9 +3,10 @@
 For every test Source 1 (S1) business, the pipeline finds the matching Source 2 / Source 3 (S2/S3) records.
 It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
 
-**Current submission:**
-- validation macro F0.5 **0.9717** (US 0.980, India 0.959);
-- candidate set of 7.3 candidates per S1 on test (validation recall 96.85% at 6.6 per S1);
+**Final submission (leaderboard 0.972):**
+- validation macro F0.5 **0.9786** (US 0.987, India 0.967; precision 0.997, recall 0.947);
+- model: two-stage LightGBM (v4), with a fine-tuned multilingual cross-encoder re-scoring the borderline pairs;
+- candidate set: 7.3 candidates per S1 on test (validation recall 96.85% at 6.6 per S1);
 - organiser validator: PASS.
 
 Methodology: `../../Documentation_template.md`. Experiment log: `../../EXPERIMENTS.md`.
@@ -14,7 +15,10 @@ Methodology: `../../Documentation_template.md`. Experiment log: `../../EXPERIMEN
 ```
 TSV -> Parquet -> EDA + S1-grouped split -> normalisation (norm-v3)
     -> blocking v3: TF-IDF searches + pruner  -> candidates (train / val / test)  = candidate_pairs.tsv
-    -> pair features feat-v2 (86)             -> LightGBM (variant C) -> selection (tau 0.65, margin 0.7)
+    -> pair features feat-v2 (86; 82 used)
+    -> model v4: stage-1 LightGBM (5-fold OOF) -> set + decoy + cross-S1 features -> stage-2 LightGBM (3 seeds)
+    -> cross-encoder (distilbert-base-multilingual-cased, fine-tuned) re-scores pairs with 0.02 < p < 0.98
+    -> blend p = 0.35 p_model + 0.65 p_ce -> selection (tau 0.625, margin 0.7, one owner per S2/S3)
     -> matching_results.tsv (+ candidate_pairs.tsv) -> organiser validator
 ```
 
@@ -23,11 +27,15 @@ TSV -> Parquet -> EDA + S1-grouped split -> normalisation (norm-v3)
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```
 - Python 3.12+; every package the pipeline imports is pinned in `requirements.txt`.
-- Optional imports, not pinned: `torch` (GPU top-k; the CPU path is used without it and was faster here) and
-  `matplotlib` (one plot in the blocking report).
+- `torch` and `transformers` are needed only for the two cross-encoder steps (10, 11), which need a CUDA GPU (a T4
+  is enough). Blocking can also use `torch` for GPU top-k, but the CPU path was faster here.
+- `matplotlib` (one plot in the blocking report) is optional and not pinned.
 - Tests: `python -m pytest tests` (pytest is a dev tool, not a pipeline dependency).
-- No external data, APIs or pretrained models are used. The only models are trained here from the provided
-  training data: LightGBM (MIT licence) and a scikit-learn HistGradientBoosting pruner (BSD-3-Clause).
+- No external data, APIs or lookups are used. Models:
+  - trained here from the provided training data: LightGBM (MIT licence) and a scikit-learn
+    HistGradientBoosting pruner (BSD-3-Clause);
+  - one pretrained model, `distilbert-base-multilingual-cased` (Apache-2.0, ~135M parameters). It is downloaded
+    from Hugging Face by step 10 and fine-tuned on the provided training pairs.
 
 Run every command below **from this folder** (`code/business_entity_resolution/`), with the organiser data in
 `../../dataset/{train,test}/*.tsv`.
@@ -53,17 +61,23 @@ The seeds are fixed (42). Runtimes and peak RAM are from our runs:
 | 5 | Job A: train candidates for all 299,728 train-split S1 (frozen v3 rule: u50, pruner tau 0.01, cap 10) | `python src/run_blocking_job_a.py --norm-dir ../../artifacts/normalised --split ../../outputs/eda/g25_split.parquet --data-dir ../../data_parquet --model-dir ../../artifacts/blocking_eval --out-dir ../../artifacts/blocking_eval` | 56 min / ~15 GB (8 vCPU) | `artifacts/blocking_eval/train_candidates.parquet` |
 | 6 | Job B: test candidates for all 1,732,544 test S1 (same rule) | `python src/run_blocking_job_b.py --norm-dir ../../artifacts/normalised --model-dir ../../artifacts/blocking_eval --out-dir ../../artifacts/blocking_eval --tsv-out ../../artifacts/blocking_eval/job_b_pairs.tsv` | 99 min / **34 GB** | `artifacts/blocking_eval/test_candidates.parquet` (the `--tsv-out` file is a pair list for inspection, **not** the official format) |
 | 7 | pair features feat-v2 for train, val (pruned to the submitted set) and test | `python src/run_features.py --input ../../artifacts --out-dir ../../artifacts/features --splits train val test --prune val` | 28 min / 14 GB | `artifacts/features/features_{train,val,test}.parquet`, report |
-| 8 | model + selection + both output files + validator (see below for the input folder) | `python src/run_model.py --input ../../artifacts/model_input --out-dir ../../artifacts/model --validator ../../utils/validate_submission.py` | 51 min / 9 GB | `artifacts/model/output/{matching_results,candidate_pairs}.tsv`, `model_C.txt`, `selection_config.json`, `model_report.md` |
-| 9 | copy the outputs and validate | `cp ../../artifacts/model/output/*.tsv ../../output/ && python3 ../../utils/validate_submission.py --matching ../../output/matching_results.tsv --candidate ../../output/candidate_pairs.tsv --test-dir ../../dataset/test` | seconds | `output/` (PASS) |
+| 8 | final model v4: stage 1 (5-fold OOF), set / decoy / cross-S1 features, stage 2 (3 seeds), unseen-country simulation, validation report, test pair scores | `python src/run_model_v4.py --input ../../artifacts/model_input --config configs/best_config.json --out-dir ../../artifacts/model_v4 --validator ../../utils/validate_submission.py` | 2.5 h / 21 GB (CPU) | `artifacts/model_v4/{val_scores,test_scores}.parquet`, `model/model_config.json`, `report.md`, `output/*.tsv` (v4 alone) |
+| 9 | (reference only) model v1 | `python src/run_model.py --input ../../artifacts/model_input --out-dir ../../artifacts/model --variants C` | 7 min | superseded by steps 8–11 |
+| 10 | cross-encoder fine-tune (GPU) | `python src/cross_encoder_train.py --input ../../artifacts/model_input --out-dir ../../artifacts/ce --pairs 3000000 --batch 64 --max-train-min 90` | 90 min on a T4 | `artifacts/ce/ce_model/`, `ce_config.json`, `ce_report.md` |
+| 11 | blend re-tuned on v4 validation scores, borderline test pairs re-scored, **both output files** + validator (GPU) | `python src/cross_encoder_score.py --input ../../artifacts/model_input --ce-dir ../../artifacts/ce --v4-dir ../../artifacts/model_v4 --out-dir ../../artifacts/ce_blend --validator ../../utils/validate_submission.py` | ~25 min on a T4 | `artifacts/ce_blend/{matching_results,candidate_pairs}.tsv`, `ce_test_report.md` |
+| 12 | copy the outputs and validate | `cp ../../artifacts/ce_blend/*.tsv ../../output/ && python3 ../../utils/validate_submission.py --matching ../../output/matching_results.tsv --candidate ../../output/candidate_pairs.tsv --test-dir ../../dataset/test` | seconds | `output/` (PASS) |
 
-Step 8 reads one folder. Link the inputs into it, so each file exists once:
+Steps 8–11 read one folder. Link the inputs into it, so each file exists once:
 ```bash
 M=../../artifacts/model_input && mkdir -p $M
 ln -sf "$(realpath ../../outputs/eda/g25_split.parquet)" $M/
-for f in train_source1 train_ground_truth; do ln -sf "$(realpath ../../data_parquet/train/$f.parquet)" $M/; done
+for f in train_source1 train_source2 train_source3 train_ground_truth; do ln -sf "$(realpath ../../data_parquet/train/$f.parquet)" $M/; done
+ln -sfn "$(realpath ../../artifacts/normalised/normalised)" $M/normalised
 for k in 1 2 3; do ln -sf "$(realpath ../../data_parquet/test/test_source$k.parquet)" $M/; done
 for s in train val test; do ln -sf "$(realpath ../../artifacts/blocking_eval/${s}_candidates.parquet)" $M/;
                            ln -sf "$(realpath ../../artifacts/features/features_$s.parquet)" $M/; done
+# step 10 also reads validation scores to report its own blend check (step 11 re-tunes on v4's):
+ln -sf "$(realpath ../../artifacts/model_v4/val_scores.parquet)" $M/   # after step 8
 ```
 
 Notes:
@@ -117,6 +131,16 @@ S1, scores only +0.0005 higher on validation, so the effect is small).
 - `src/candidates.py`: selection rules, the cheap pruner (features, training, chunked scoring), list statistics.
   Tests in `tests/test_candidates.py`.
 - `src/model.py`: LightGBM training / prediction and the feature sets A / B / C.
+- `src/two_stage.py`: stage-1 out-of-fold training and the 8 set features; `src/pair_extra.py`: the 18 targeted
+  decoy features; `src/pipeline.py`: the shared stage-2 frame (C + set + decoy features).
+- `src/run_model_v4.py`: the final model v4 (cross-S1 features, unseen-country simulation, validation report,
+  test pair scores and v4 output files). `configs/best_config.json`: the tuned stage-2 settings (from
+  `src/run_model_v3.py`).
+- `src/cross_encoder_train.py`: fine-tunes `distilbert-base-multilingual-cased` on training candidate pairs and
+  checks the blend on validation. `src/cross_encoder_score.py`: re-tunes the blend on v4's validation scores,
+  re-scores the borderline test pairs and writes the final output files.
+- `src/train_model.py`, `src/predict.py`, `src/run_final.py`, `src/run_two_stage.py`, `src/run_model_v3.py`:
+  the v2 / v3 experiment runners (kept for reference; the final outputs come from steps 8–11).
 - `src/selection.py`: threshold, one owner per S2/S3, margin; vectorised macro F0.5 (tests in `tests/test_selection.py`).
 - `src/run_model.py`: model + selection end to end (training, validation, stress test, test outputs, validator).
 - `src/write_candidates.py`: `candidate_pairs.tsv` from the blocking output, with checks and the validator.

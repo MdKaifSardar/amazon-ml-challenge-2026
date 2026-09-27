@@ -7,3 +7,9 @@ scipy==1.18.1
 scikit-learn==1.9.1
 sparse-dot-topn==1.2.0
 lightgbm==4.7.0
+# cross-encoder (GPU steps: cross_encoder_train.py, cross_encoder_score.py); versions of the Kaggle image used
+torch==2.10.0
+transformers==5.0.0
+tokenizers==0.22.2
+safetensors==0.7.0
+huggingface_hub==1.11.0

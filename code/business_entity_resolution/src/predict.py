@@ -94,6 +94,7 @@ def main() -> None:
     sel = {**cfg["selection"], "one_owner": True}  # an S2/S3 matches at most one S1; on test all S1 compete
     matched = select(st.select("s1", "cand", "p"), **sel)
     log(f"{matched.height:,} matches")
+    st.select("s1", "cand", "p").write_parquet(a.out_dir.parent / "test_scores.parquet")  # pair probabilities (for blends)
 
     cand = pl.read_parquet(raw_file(a.input, "test_candidates.parquet"), columns=["s1", "cand", "p_u50"])
     assert cand.select("s1", "cand").sort("s1", "cand").equals(st.select("s1", "cand").sort("s1", "cand")), "scored pairs != candidate set"
