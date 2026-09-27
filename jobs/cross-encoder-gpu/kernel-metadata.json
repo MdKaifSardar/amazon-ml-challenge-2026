@@ -1,0 +1,17 @@
+{
+  "id": "mdkaifsardar/cross-encoder-gpu",
+  "title": "cross-encoder-gpu",
+  "code_file": "cross-encoder-gpu.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sayanchatterjee264/normalize-v3-features",
+    "mdkaifsardar/amazon-ml-2026-blocking-v3",
+    "sayanchatterjee264/amazon-ml-2026"
+  ],
+  "competition_sources": [],
+  "kernel_sources": []
+}

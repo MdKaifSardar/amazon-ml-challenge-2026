@@ -55,6 +55,8 @@ artifacts/
 outputs/
 output/
 scratch/
+submissions/
+TEAMNAME_submission/
 
 # Credentials & secrets (never commit)
 .env
