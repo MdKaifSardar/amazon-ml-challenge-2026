@@ -6,9 +6,12 @@ candidate, raw organiser text, max 128 tokens.
 Blend (borderline pairs only, BAND[0] < p_model < BAND[1]): p = (1 - w) * p_model + w * p_ce; other pairs keep
 p_model. Then the usual selection (threshold, margin, one owner per S2/S3).
 
-Test usage (GPU):
-  python src/cross_encoder_score.py --input DIR --ce-dir DIR --scores test_scores.parquet --config ce_config.json \
-      --out-dir output/ce_blend [--validator utils/validate_submission.py] [--current output/matching_results.tsv]
+Test usage (GPU), after run_model_v4.py and cross_encoder_train.py:
+  python src/cross_encoder_score.py --input DIR --ce-dir DIR --v4-dir DIR --out-dir output/ce_blend [--validator PATH]
+The blend is re-tuned on model v4's validation scores (w and threshold on the tune half, margin and one owner as
+v4; report half = check), so it matches the model whose test scores it re-scores. GO only if the report half beats
+w = 0 overall AND for US and India with precision >= 0.99; otherwise w = 0 (the v4 scores unchanged). Countries
+not in train get v4's unseen-country threshold shift (0 unless v4's simulation kept it).
 """
 from __future__ import annotations
 
@@ -78,69 +81,102 @@ def blend(p_model: np.ndarray, p_ce: np.ndarray, w: float) -> np.ndarray:
     return p
 
 
+WS = [0.0, 0.35, 0.5, 0.65, 0.8, 0.9, 1.0]
+
+
 def main() -> None:
-    import torch
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
-    from selection import select
+    from selection import f05_table, select, summary
     from submission import write_submission
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, type=Path)
-    ap.add_argument("--ce-dir", required=True, type=Path, help="folder holding ce_model/ and ce_config.json (searched)")
-    ap.add_argument("--scores", required=True, type=Path, help="test pair probabilities of the final model (searched if a folder)")
+    ap.add_argument("--ce-dir", required=True, type=Path, help="folder holding ce_model/ (searched)")
+    ap.add_argument("--v4-dir", required=True, type=Path, help="folder holding model v4's test_scores / val_scores / model_config (searched)")
     ap.add_argument("--out-dir", required=True, type=Path)
     ap.add_argument("--validator", default=None)
-    ap.add_argument("--current", default=None, type=Path, help="current final matching_results.tsv to compare with")
     a = ap.parse_args()
     a.out_dir.mkdir(parents=True, exist_ok=True)
-    cfg_path = next(a.ce_dir.rglob("ce_config.json"))
-    cfg = json.loads(cfg_path.read_text())
-    mdir = cfg_path.parent / "ce_model"
-    sp = a.scores if a.scores.is_file() else next(a.scores.rglob("test_scores.parquet"))
-    st = pl.read_parquet(sp)
-    border = st.filter((pl.col("p") > BAND[0]) & (pl.col("p") < BAND[1]))
-    log(f"test pairs {st.height:,}; borderline {border.height:,} ({border.height / st.height:.1%}); w = {cfg['w']}, selection {cfg['selection']}")
+    mdir = next(p for p in a.ce_dir.rglob("config.json") if p.parent.name == "ce_model").parent
+    v4cfg = json.loads(next(a.v4_dir.rglob("model_config.json")).read_text())
     tok = AutoTokenizer.from_pretrained(mdir)
     model = AutoModelForSequenceClassification.from_pretrained(mdir).to("cuda")
-    txt = texts(a.input, "test", pl.concat([border["s1"], border["cand"]]).unique())
-    t0 = time.time()
-    p_ce = score_pairs(model, tok, border.select("s1", "cand"), txt)
-    log(f"scored {border.height:,} borderline test pairs in {time.time() - t0:.0f}s ({border.height / max(time.time() - t0, 1e-9):.0f} pairs/s)")
-    st = st.join(border.select("s1", "cand").with_columns(pl.Series("p_ce", p_ce)), on=["s1", "cand"], how="left")
-    st = st.with_columns(pl.Series("p_blend", blend(st["p"].to_numpy(), st["p_ce"].fill_null(np.nan).to_numpy(), cfg["w"])))
-    st.write_parquet(a.out_dir / "test_scores_blend.parquet")
-    matched = select(st.select("s1", "cand", pl.col("p_blend").alias("p")), **{**cfg["selection"], "one_owner": True})
+    rep = ["# Cross-encoder blend on model v4\n", f"v4: selection {v4cfg['selection']}, unseen shift {v4cfg['unseen_tau_shift']}, "
+           f"pseudo-label {v4cfg['pseudo_label']}, cross features {v4cfg['use_cross']}.\n"]
+
+    # ---- validation: re-tune the blend on v4's validation scores
+    vs = pl.read_parquet(next(a.v4_dir.rglob("val_scores.parquet"))).select("s1", "cand", "p")
+    split = pl.read_parquet(find(a.input, "g25_split.parquet"))
+    val_s1 = split.filter(pl.col("role") == "val").select(pl.col("source1_entity_id").alias("s1")).join(
+        pl.read_parquet(find(a.input, "train_source1.parquet"), columns=["entity_id", "country"]).rename({"entity_id": "s1"}), on="s1", how="left")
+    gt = pl.read_parquet(find(a.input, "train_ground_truth.parquet"))
+    truth = (gt.join(val_s1, left_on="source1_entity_id", right_on="s1", how="semi")
+             .select(pl.col("source1_entity_id").alias("s1"), pl.col("matched_entity_ids").str.split(",").alias("cand"))
+             .explode("cand", empty_as_null=True).filter(pl.col("cand").is_not_null() & (pl.col("cand") != "")))
+    half = pl.col("s1").str.extract(r"(\d+)$").cast(pl.Int64) % 2
+    s1_tune, s1_rep = val_s1.filter(half == 0), val_s1.filter(half == 1)
+    vb = vs.filter((pl.col("p") > BAND[0]) & (pl.col("p") < BAND[1]))
+    vtxt = texts(a.input, "train", pl.concat([vb["s1"], vb["cand"]]).unique())
+    p_ce_v = score_pairs(model, tok, vb.select("s1", "cand"), vtxt, log_every=0)
+    log(f"validation borderline pairs scored: {vb.height:,}")
+    full = vs.join(vb.select("s1", "cand").with_columns(pl.Series("p_ce", p_ce_v)), on=["s1", "cand"], how="left")
+    pm, pc = full["p"].to_numpy(), full["p_ce"].fill_null(np.nan).to_numpy()
+    cur = {"margin": v4cfg["selection"]["margin"], "one_owner": True}
+    res = []
+    for w in WS:
+        sv = full.select("s1", "cand").with_columns(pl.Series("p", blend(pm, pc, w)))
+        grid = [(f05_table(select(sv, tau=t, **cur), truth, s1_tune)["f05"].mean(), t) for t in [round(x, 3) for x in np.arange(0.30, 0.91, 0.025)]]
+        f_t, tau = max(grid)
+        sm = summary(f05_table(select(sv, tau=tau, **cur), truth, s1_rep), by="country")
+        gg = {r["group"]: r for r in sm.iter_rows(named=True)}
+        res.append({"w": w, "tau": tau, "tune_f05": f_t, **{k: gg[k]["macro_f05"] for k in gg}, "precision": gg["overall"]["precision"],
+                    "recall": gg["overall"]["recall"]})
+        log(f"w {w}: {res[-1]}")
+    res = pl.DataFrame(res)
+    base = res.filter(pl.col("w") == 0.0).row(0, named=True)
+    best = res.filter(pl.col("w") > 0).sort("tune_f05", descending=True).row(0, named=True)
+    go = (best["overall"] > base["overall"] and best["country=US"] > base["country=US"] and best["country=India"] > base["country=India"]
+          and best["precision"] >= 0.99)
+    ch = best if go else base
+    rep += ["## Validation (report half; tau tuned on the tune half)\n", str(res) + "\n",
+            f"**GO = {go}**: w = {ch['w']}, tau = {ch['tau']} (report {ch['overall']:.4f} vs w=0 {base['overall']:.4f})\n"]
+    log(f"GO = {go}; using w {ch['w']} tau {ch['tau']}")
+
+    # ---- test
+    st = pl.read_parquet(next(a.v4_dir.rglob("test_scores.parquet")))
     s1_all = pl.read_parquet(find(a.input, "test_source1.parquet"), columns=["entity_id", "country"]).rename({"entity_id": "s1"})
+    if ch["w"] > 0:
+        border = st.filter((pl.col("p") > BAND[0]) & (pl.col("p") < BAND[1]))
+        txt = texts(a.input, "test", pl.concat([border["s1"], border["cand"]]).unique())
+        t0 = time.time()
+        p_ce = score_pairs(model, tok, border.select("s1", "cand"), txt)
+        log(f"scored {border.height:,} borderline test pairs in {time.time() - t0:.0f}s")
+        st = st.join(border.select("s1", "cand").with_columns(pl.Series("p_ce", p_ce)), on=["s1", "cand"], how="left")
+    else:
+        st = st.with_columns(pl.lit(None, dtype=pl.Float64).alias("p_ce"))
+    st = st.with_columns(pl.Series("p_blend", blend(st["p"].to_numpy(), st["p_ce"].fill_null(np.nan).to_numpy(), ch["w"])))
+    st.write_parquet(a.out_dir / "test_scores_blend.parquet")
+    unseen = ~pl.col("country").is_in(v4cfg["train_countries"])
+    tau_row = (pl.lit(ch["tau"]) + pl.when(unseen).then(pl.lit(v4cfg["unseen_tau_shift"])).otherwise(0.0)).clip(0.3, 0.9)
+    x = st.join(s1_all, on="s1", how="left").filter(pl.col("p_blend") >= tau_row)
+    matched = select(x.select("s1", "cand", pl.col("p_blend").alias("p")), tau=0.0, **cur)
     cand = pl.read_parquet(find(a.input, "test_candidates.parquet"), columns=["s1", "cand", "p_u50"])
     lists = cand.sort(["s1", "p_u50", "cand"], descending=[False, True, False], nulls_last=True).group_by("s1", maintain_order=True).agg(pl.col("cand"))
     ml = matched.sort(["s1", "p"], descending=[False, True]).group_by("s1", maintain_order=True).agg(pl.col("cand"))
     write_submission(a.out_dir, s1_all["s1"].to_list(), dict(zip(ml["s1"].to_list(), ml["cand"].to_list())),
                      dict(zip(lists["s1"].to_list(), lists["cand"].to_list())))
-    rep = [f"# Cross-encoder blend on test (w = {cfg['w']})\n", f"Borderline pairs scored: {border.height:,}. Matches: {matched.height:,}.\n"]
+    rep.append(f"Test: {matched.height:,} matches.\n")
     if a.validator:
         import importlib.util
-        spec = importlib.util.spec_from_file_location("vs", a.validator); vs = importlib.util.module_from_spec(spec); spec.loader.exec_module(vs)
+        spec = importlib.util.spec_from_file_location("vs", a.validator); vs_ = importlib.util.module_from_spec(spec); spec.loader.exec_module(vs_)
         with tempfile.TemporaryDirectory() as td:
             for k in (1, 2, 3):
                 pl.read_parquet(find(a.input, f"test_source{k}.parquet"), columns=["entity_id"]).write_csv(Path(td) / f"test_source{k}.tsv", separator="\t")
-            e, w = vs.validate(str(a.out_dir / "matching_results.tsv"), str(a.out_dir / "candidate_pairs.tsv"), td, check_ids=True)
+            e, w = vs_.validate(str(a.out_dir / "matching_results.tsv"), str(a.out_dir / "candidate_pairs.tsv"), td, check_ids=True)
         rep.append(f"Validator (--check-ids): {len(e)} errors, {len(w)} warnings {e[:3]}\n")
         log(f"validator: {len(e)} errors, {len(w)} warnings")
     n = s1_all.join(matched.group_by("s1").len("n"), on="s1", how="left").with_columns(pl.col("n").fill_null(0))
-    pc = n.group_by("country").agg(pl.col("n").mean().alias("matches_per_s1"), (pl.col("n") == 0).mean().alias("share_no_match")).sort("country")
-    rep += ["## Matches per S1\n", str(pc) + "\n"]
-    new = matched.select("s1", "cand").with_columns(pl.lit(True).alias("m"))
-    fr = s1_all.filter(pl.col("country") == "France").sample(10, seed=42)
-    ex = fr.join(matched, on="s1", how="left").join(st.select("s1", "cand", "p", "p_ce"), on=["s1", "cand"], how="left")
-    t_fr = texts(a.input, "test", pl.concat([ex["s1"], ex["cand"].drop_nulls()]).unique())
-    ex = ex.with_columns(pl.col("s1").replace_strict(t_fr, default="").alias("s1_text"), pl.col("cand").replace_strict(t_fr, default="").alias("cand_text"))
-    rep += ["## 10 random French S1\n", str(ex.select("s1_text", "cand_text", "p", "p_ce")) + "\n"]
-    if a.current and a.current.exists():
-        cur = pl.read_csv(a.current, separator="\t", quote_char=None, infer_schema=False).select(
-            pl.col("source1_entity_id").alias("s1"), pl.col("matched_entity_ids").fill_null("").str.split(",").list.eval(pl.element().filter(pl.element() != "")).list.sort().alias("m0"))
-        nm = s1_all.join(matched.group_by("s1").agg(pl.col("cand").sort().alias("m1")), on="s1", how="left").with_columns(pl.col("m1").fill_null([]))
-        ch = nm.join(cur, on="s1").with_columns((pl.col("m1") != pl.col("m0")).alias("changed")).group_by("country").agg(
-            pl.col("changed").sum().alias("s1_changed"), pl.col("changed").mean().alias("share")).sort("country")
-        rep += ["## Change vs the current final\n", str(ch) + "\n"]
+    pcn = n.group_by("country").agg(pl.col("n").mean().alias("matches_per_s1"), (pl.col("n") == 0).mean().alias("share_no_match")).sort("country")
+    rep += ["## Matches per S1\n", str(pcn) + "\n"]
     (a.out_dir / "ce_test_report.md").write_text("\n".join(rep))
     log("done")
 

@@ -477,3 +477,38 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
     0.9739–0.9747). The largest remaining model-side group is empty-address pairs (57% recall), which the data
     cannot separate from same-name decoys without an address.
   - Step C (cross-encoder score): no scores arrived, so skipped.
+
+## 2026-09-27 19:00–21:00: model v4 and cross-encoder blend (last day, 2 submissions left, last one counts)
+- Leaderboard so far: 0.966 (teammate's v3 file). The France-emptied probe (0.834) gives France F0.5 ≈ 0.93 and US + India ≈ 0.972.
+- **Cross-encoder** (`ce-train`, Kaggle P100):
+  - model `distilbert-base-multilingual-cased`, licence **apache-2.0** (read from the model card);
+  - input "name | address | country" of both records, max 128 tokens (0.2% truncated);
+  - 1 epoch on 1,430,682 blocking-v3 train candidate pairs (the time budget cut the requested 3M: 265 pairs/s), 74.8 min;
+  - held-out AUC 0.9985.
+- Borderline blend on the v3 validation scores:
+  - pairs with 0.02 < p < 0.98 (75,752) get p = (1 − w)·p_model + w·p_ce;
+  - tau tuned on the tune half, margin 0.7, one owner;
+  - on the borderline pairs, the cross-encoder AUC beats the model: 0.945 vs 0.927 overall, 0.996 vs 0.952 for Indian-script candidates.
+
+  | w | tau | report F0.5 | precision | recall |
+  |---|---|---|---|---|
+  | 0 (v3) | 0.50 | 0.9747 | 0.9943 | 0.9427 |
+  | 0.35 | 0.425 | 0.9775 | 0.9962 | 0.9445 |
+  | 0.5 | 0.50 | 0.9780 | 0.9965 | 0.9454 |
+  | 0.65 | 0.625 | **0.9783** | 0.9963 | 0.9471 |
+
+  GO (beats v3 overall, in US and in India, precision ≥ 0.99): **kept**, +0.36 pt.
+  `ce-test` re-tunes w (grid extended to 0.8 / 0.9 / 1.0) and tau on model v4's validation scores before scoring test.
+- **Model v4** (`run_model_v4.py`, Kaggle CPU), results pending:
+  - v3 plus cross-S1 features (the candidate's best stage-1 probability with another S1, the number of other S1 above 0.5, and this pair's lead);
+  - an unseen-country simulation: stage 2 trained on US only and scored on India, and the reverse; a threshold shift and pseudo-labels are applied to countries not in train only if they help in both directions.
+- **Final (2026-09-27 ~23:35): leaderboard 0.972** (from 0.966), with v4 + the cross-encoder blend on borderline pairs.
+  - Model v4 on validation: the cross-S1 features were kept (1 seed 0.9744 → 0.9750). Final 3 seeds scored 0.9748 on the report half (τ 0.45). The v4 test matches are 99.6% identical to the 0.966 file.
+  - Unseen-country simulation: the threshold shifts disagree in sign (US → India −0.15, India → US +0.20), and pseudo-labels changed F0.5 by ±0.0005. Neither is applied to France.
+  - `ce-test` re-tuned the blend on the v4 validation scores:
+    - w = 0.65, τ 0.625 → report half **0.9786** (v4 alone 0.9748), precision 0.9965;
+    - 1,373,557 borderline test pairs scored (run in Colab on a GPU, because the Kaggle GPU queue was full);
+    - validator (--check-ids): 0 errors;
+    - matches per S1: France 3.29, India 3.19, US 3.35.
+  - Leaderboard gain +0.6, larger than the validation gain (+0.38): the cross-encoder probably helps France more than US and India.
+  - Not finished: the CPU sharded scoring (27 pairs/s per job, too slow).

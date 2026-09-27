@@ -14,6 +14,7 @@
   "competition_sources": [],
   "kernel_sources": [
     "sayanchatterjee264/ce-train",
-    "sayanchatterjee264/model-v3-final-pretrained"
+    "sayanchatterjee264/model-v4",
+    "sayanchatterjee264/phase0-eda"
   ]
 }

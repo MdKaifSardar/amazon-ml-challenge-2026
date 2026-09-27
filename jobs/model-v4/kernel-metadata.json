@@ -1,0 +1,21 @@
+{
+  "id": "sayanchatterjee264/model-v4",
+  "title": "model-v4",
+  "code_file": "model-v4.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "sayanchatterjee264/amazon-ml-2026",
+    "mdkaifsardar/amazon-ml-2026-blocking-v3",
+    "ananyaghosh09/amazon-ml-2026-features-v2"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [
+    "sayanchatterjee264/phase0-eda",
+    "sayanchatterjee264/normalise-v3",
+    "sayanchatterjee264/model-v3-exp"
+  ]
+}

@@ -111,7 +111,7 @@ def main() -> None:
     proj = n_tr / tr_rate / 60
     log(f"smoke: train {tr_rate:.0f} pairs/s, score {sc_rate:.0f} pairs/s; full training projected {proj:.1f} min for {n_tr:,} pairs")
     if proj > a.max_train_min:
-        keep_s1 = pairs.filter(~pl.col("hold")).select("s1").unique().head(int(250_000 / per))
+        keep_s1 = pairs.filter(~pl.col("hold")).select("s1").unique(maintain_order=True).head(int(tr_rate * a.max_train_min * 60 / per))
         pairs = pl.concat([pairs.filter(pl.col("hold")), pairs.filter(~pl.col("hold")).join(keep_s1, on="s1", how="semi")])
         n_tr = int((~pairs["hold"]).sum())
         log(f"cut to {n_tr:,} training pairs (projected {n_tr / tr_rate / 60:.1f} min)")
