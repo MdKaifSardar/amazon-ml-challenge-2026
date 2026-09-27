@@ -7,6 +7,7 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
 |---|---|---|---|---|---|---|
 | 2026-09-25 13:05 | All-empty baseline (`src/baseline_empty.py`) | n/a (no candidates) | 0.0559 | 0.0562 / 0.0554 | 1.0 / 0.0 | Reference |
 | 2026-09-27 01:10 | LightGBM variant C on feat-v2 + selection (tau 0.65, margin 0.7), Kaggle `model-v1` | 0.9685 (candidate set, 6.56 per S1) | **0.9717** (report half) | 0.9804 / 0.9586 | 0.9677 / 0.9720 | **Kept** (first submission) |
+| 2026-09-27 13:20 | Two-stage model (stage-1 OOF C + set features, 3 seeds), tau 0.55, margin 0.7, one owner (always on test), Kaggle `model-v2` | 0.9685 (unchanged) | **0.9742** (report half) | 0.9830 / 0.9610 | – | **Kept** (upload 2) |
 
 ## Run log
 
@@ -392,3 +393,51 @@ One row per experiment. Val F0.5 is macro F0.5 on held-out S1 entities (validati
   - Features-v2 on the affected lists passed all checks.
   - **Dropped:** about +0.1 pt of overall recall for ~10% more candidates, which the ranking penalises. India's
     missing pairs are mostly not spelling / transliteration variants of the name.
+
+- **2026-09-27, model v2: two-stage model + selection rules** (`src/two_stage.py`, `src/run_two_stage.py`; Kaggle CPU
+  `model-v2`, 50 min). Blocking, candidates and features-v2 are unchanged.
+  - Stage 1: variant C, 5-fold out-of-fold on the 199,699 non-pruner train S1 (folds by S1); validation / test use
+    the average of the fold models. Report F0.5 0.9716, the same as v1.
+  - Set features (list-local, so train / val / test are consistent):
+    - the pair's stage-1 p, rank and gap to the S1's best;
+    - how many candidates of the S1 have p > 0.5 / > 0.9;
+    - the candidate's max name / address similarity and first-house-number match to the S1's OTHER confident
+      (p > 0.8) candidates.
+
+    Cross-S1 counts are not used: they depend on which S1 were queried.
+  - Stage 2 (C + 8 set features):
+    - 1 seed: 0.9740;
+    - **3 seeds averaged: 0.9742** (US 0.9830, India 0.9610): **+0.25 pt, better overall and in both countries,
+      kept.**
+    - Chosen selection: tau 0.55, margin 0.7, one owner.
+    - The secondary threshold (look-alike of a confident match) was never chosen on the tune half.
+    - Calibration on the tune half is good (e.g. mean p 0.55 -> 0.53 match rate, 0.75 -> 0.77).
+    - Stage-2 gain: s_p1 0.85, s_gap 0.10, s_n09 0.02, s_num_eq.
+  - Error analysis (stage 1, report half, 173,406 true pairs):
+    - **model-side misses: 5,468 true candidates (3.2%)**, US 3,471 / India 1,997. By probability:
+      - < 0.1: 1,170;
+      - 0.1–0.3: 1,327;
+      - 0.3–0.5: 1,340;
+      - 0.5–tau: 1,402;
+      - lost to margin / owner: 229.
+    - False positives: 1,053.
+    - Missed patterns:
+      - near-identical names with an EMPTY candidate address ("Liberty Álliance", "Schultz Mobile LP", "Upper-Fields,");
+      - trade names / websites unrelated to the S1 name at the same address ("Vantagequohalo", "ffgen.com");
+      - legal-suffix-only differences with a missing or partial address;
+      - one Devanagari name ("एपेक्स डेवलपर्स प्रा. लि.").
+    - False-positive patterns (p ≈ 1.0):
+      - same name and address, different legal form (PLLC / LLC, LLC / Co, & Co / LLP);
+      - an extra or different descriptor word (Chhattisgarh Solutions vs "Chhattisgarh Limited Trendz");
+      - unrelated trade names at the same address.
+    - **45.9% of the false positives (v2 selection) are records whose true owner is ANOTHER S1**, mostly S1
+      outside our train / val sample ("unused" role). On test all S1 compete, so the one-owner rule (always on for
+      test) can remove such matches. Validation cannot show this gain.
+  - Test: 0 S2/S3 records matched to 2+ S1 (v1: 10,165 records in 15,451 S1: France 5,972, India 7,277, US 2,202).
+    - Matches differ from v1 (as sets) for 7.7% of French, 5.5% of Indian and 5.2% of US S1.
+    - Matches per S1: France 3.32 / India 3.19 / US 3.36; no match: 5.4% / 6.8% / 5.9%.
+    - Validator PASS; candidate_pairs.tsv unchanged. `output/matching_results.tsv` = v2 (v1 is kept in
+      `outputs/model-v1/output/`).
+    - A French by-eye check (10 S1): mostly correct. Some likely decoys got through: same address, differing
+      descriptor word ("Domicile Aida Amicale SARL" for "Domicile Aida Ehpad SARL", p 0.95; "HEART PARENTS" for
+      "Heart Comite SAS", p 0.94).
