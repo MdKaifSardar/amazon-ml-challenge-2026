@@ -9,7 +9,7 @@ It produces `output/matching_results.tsv` and `output/candidate_pairs.tsv`.
 - candidate set: 7.3 candidates per S1 on test (validation recall 96.85% at 6.6 per S1);
 - organiser validator: PASS.
 
-Methodology: `../../Documentation_template.md`. Experiment log: `../../EXPERIMENTS.md`.
+Methodology: `../../SOLUTION_REPORT.md`. Experiment log: `../../EXPERIMENTS.md`.
 
 ## Pipeline at a glance
 ```
