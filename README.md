@@ -98,8 +98,8 @@ Raw TSV Data (24M+ records)
 │       └── requirements.txt            # Pinned dependencies
 ├── docs/                               # EDA findings, normalisation rules, and notes
 ├── submissions/                        # Submission archives and templates
-├── EXPERIMENTS.md                      # Comprehensive log of all runs, metrics, and ablations
-└── Documentation_template.md           # Formal competition technical report
+├── EXPERIMENTS.md                 # Comprehensive log of all runs, metrics, and ablations
+└── SOLUTION_REPORT.md              # Formal technical report and methodology
 ```
 
 ---

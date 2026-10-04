@@ -69,6 +69,8 @@ aws-setup/
 
 # Local assistant context & personal scratchpad (not published)
 CLAUDE.md
+AGENTS.md
+.agents/
 context/
 *.pdf
 
